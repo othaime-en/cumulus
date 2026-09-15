@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Environments
+.venv/
+.env
+
+# Runtime state (this is emulator data, not source)
+data/*
+!data/.gitkeep
+!data/s3/.gitkeep
+
+# Editor/OS cruft
+.vscode/
+.DS_Store
