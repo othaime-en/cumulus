@@ -1,0 +1,9 @@
+services:
+  cumulus:
+    build: .
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
