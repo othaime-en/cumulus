@@ -17,3 +17,6 @@ data/*
 # Editor/OS cruft
 .vscode/
 .DS_Store
+
+# Internal dev files (private internal dev files, not part of the public repo)
+internal-dev-files/
