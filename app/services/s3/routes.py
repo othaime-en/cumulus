@@ -151,8 +151,8 @@ def get_object(
         ) from None
     return Response(
         content=body,
-        media_type=meta.content_type,
         headers={
+            "Content-Type": meta.content_type,
             "ETag": f'"{meta.etag}"',
             "Last-Modified": iso_to_http_date(meta.last_modified),
             "Content-Length": str(meta.size),
@@ -176,8 +176,8 @@ def head_object(
         ) from None
     return Response(
         status_code=200,
-        media_type=meta.content_type,
         headers={
+            "Content-Type": meta.content_type,
             "ETag": f'"{meta.etag}"',
             "Last-Modified": iso_to_http_date(meta.last_modified),
             "Content-Length": str(meta.size),
