@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+from app.services.s3.routes import router as s3_router
+
 router = APIRouter()
 
 
@@ -9,6 +11,9 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Service routers (S3, SQS, DynamoDB, ...) are included here as they're built
-# out e.g. router.include_router(s3_router). This module's job is dispatch
-# only - each service owns its own request parsing and semantics.
+# Service routers are included after gateway-internal routes (like the
+# health check above) on purpose: Starlette matches routes in registration
+# order, and S3's bucket path pattern (`/{bucket_name}`) would otherwise
+# happily "match" a request for `/_health` too. Registering health first
+# means it keeps matching priority.
+router.include_router(s3_router)
