@@ -19,9 +19,12 @@ import pytest
 import uvicorn
 from botocore.client import BaseClient
 from botocore.config import Config
+from sqlalchemy import create_engine
+from sqlalchemy.pool import StaticPool
 
 from app.main import app
 from app.services.s3.storage import S3Storage, get_s3_storage
+from app.services.sqs.storage import SqsStorage, get_sqs_storage
 
 
 def _free_port() -> int:
@@ -83,4 +86,38 @@ def s3_client(server_port: int, s3_storage: S3Storage) -> BaseClient:
             request_checksum_calculation="when_required",
             response_checksum_validation="when_required",
         ),
+    )
+
+
+@pytest.fixture
+def sqs_storage() -> Iterator[SqsStorage]:
+    """Give each test its own isolated, empty SQS database.
+
+    An in-memory SQLite engine with StaticPool (a single shared connection)
+    is used instead of a tmp_path file: SQS's data model is fully relational
+    (no on-disk blobs the way S3 has), so there's nothing a real file buys
+    here, and in-memory keeps the test suite fast. StaticPool matters
+    specifically because SQLite's default `:memory:` behavior is one
+    database *per connection* — without it, the server thread and the test
+    thread would each see their own empty database.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    storage = SqsStorage(engine=engine)
+    app.dependency_overrides[get_sqs_storage] = lambda: storage
+    yield storage
+    app.dependency_overrides.pop(get_sqs_storage, None)
+
+
+@pytest.fixture
+def sqs_client(server_port: int, sqs_storage: SqsStorage) -> BaseClient:
+    return boto3.client(
+        "sqs",
+        endpoint_url=f"http://127.0.0.1:{server_port}",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
     )
