@@ -78,3 +78,52 @@ s3.put_object(Bucket="my-bucket", Key="hello.txt", Body=b"hello world")
 Supported operations: `CreateBucket`, `DeleteBucket`, `HeadBucket`,
 `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `ListObjectsV2`
 (with `Prefix`/`Delimiter`).
+
+## Using the SQS API
+
+Unlike S3, SQS needs no special `boto3` `Config` at all — current
+botocore already defaults SQS clients to the AWS JSON protocol
+(`X-Amz-Target` header, JSON body), which is exactly what Cumulus
+implements, so a stock client just works:
+
+```python
+import boto3
+
+sqs = boto3.client(
+    "sqs",
+    endpoint_url="http://localhost:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+
+queue_url = sqs.create_queue(QueueName="my-queue")["QueueUrl"]
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody="hello world",
+    MessageAttributes={"OrderId": {"DataType": "String", "StringValue": "abc-123"}},
+)
+
+received = sqs.receive_message(QueueUrl=queue_url, MessageAttributeNames=["All"])
+print(received["Messages"][0]["Body"])
+```
+
+Supported operations: `CreateQueue` (idempotent), `DeleteQueue`,
+`GetQueueUrl`, `ListQueues` (with `QueueNamePrefix`), `GetQueueAttributes`,
+`SetQueueAttributes`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`
+(with visibility-timeout emulation), `DeleteMessage`, `DeleteMessageBatch`,
+and `MessageAttributes` (String/Binary) on send and receive.
+
+**Known gaps:** no dead-letter queues yet, no FIFO queues, and
+`WaitTimeSeconds` (long polling) returns immediately with whatever's
+currently visible rather than actually waiting. `MD5OfMessageAttributes`
+is a stable-but-non-AWS-matching hash — informational only, since no
+`boto3` code path validates it client-side; `MD5OfMessageBody` is exact.
+
+## Troubleshooting
+
+**`WinError 10013` on startup (Windows):** the default port (4566) can
+fall inside a range Hyper-V/WSL2/Docker has reserved for itself. Check
+with `netsh interface ipv4 show excludedportrange protocol=tcp`, and if
+4566 is in a listed range, just pick a different port
+(`--port 5566`, for example) rather than fighting Windows for it.
