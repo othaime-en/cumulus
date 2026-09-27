@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.gateway.errors import EmulatorError
+from app.services.dynamodb.routes import dispatch as dynamodb_dispatch
+from app.services.dynamodb.storage import DynamoDbStorage, get_dynamodb_storage
 from app.services.s3.routes import router as s3_router
 from app.services.sqs.routes import dispatch as sqs_dispatch
 from app.services.sqs.storage import SqsStorage, get_sqs_storage
@@ -24,9 +26,11 @@ def health_check() -> dict[str, str]:
 
 @router.post("/", include_in_schema=False)
 async def json_protocol_dispatch(
-    request: Request, storage: SqsStorage = Depends(get_sqs_storage)
+    request: Request,
+    sqs_storage: SqsStorage = Depends(get_sqs_storage),
+    dynamodb_storage: DynamoDbStorage = Depends(get_dynamodb_storage),
 ) -> Response:
-    """Entry point for every AWS-JSON-protocol service (SQS now, DynamoDB later). 
+    """Entry point for every AWS-JSON-protocol service (SQS, DynamoDB).
     Unlike S3's REST routes, these services all share a single
     `POST /` — the operation lives in the `X-Amz-Target` header instead of
     the URL, so there's exactly one FastAPI path here and the real
@@ -40,7 +44,7 @@ async def json_protocol_dispatch(
 
     Deviation from the plan: the plan's SQS section describes an `Action`
     query-param/form-body protocol (the legacy Query API). Current
-    boto3/botocore defaults to the JSON protocol shown above instead
+    boto3/botocore defaults to the JSON protocol shown above instead.
     """
     target = request.headers.get("x-amz-target", "")
     service, _, action = target.partition(".")
@@ -49,11 +53,13 @@ async def json_protocol_dispatch(
     payload = await request.json() if body else {}
 
     if service == "AmazonSQS":
-        result = sqs_dispatch(action, payload, str(request.base_url), storage)
+        result = sqs_dispatch(action, payload, str(request.base_url), sqs_storage)
         return JSONResponse(content=result, media_type=_JSON_MEDIA_TYPE)
 
-    # DynamoDB's target prefix ("DynamoDB_20120810") is a clear Phase 3 branch
-    # to add here — same header, same dispatch shape, different service module.
+    if service == "DynamoDB_20120810":
+        result = dynamodb_dispatch(action, payload, dynamodb_storage)
+        return JSONResponse(content=result, media_type=_JSON_MEDIA_TYPE)
+
     raise UnknownServiceTarget(f"Unrecognized service target: {target!r}")
 
 
