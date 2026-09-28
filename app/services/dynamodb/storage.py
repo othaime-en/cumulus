@@ -2,14 +2,17 @@
 
 Unlike `SqsStorage` (fixed schema, two tables total), this repository
 manages *dynamic* schema: every `CreateTable` call gets its own physical
-SQLite table for item storage.
+SQLite table for item storage, matching the plan's literal "one SQLite
+table per emulated DynamoDB table" (§6.3), as opposed to the simpler
+shared-table alternative that was considered and turned down for this
+phase.
 
 Two tiers of state:
 - `dynamodb_tables`: one fixed registry table (like `sqs_queues`) holding
   each table's metadata - key schema, attribute types, billing mode, etc.
 - one dynamically-created physical table per DynamoDB table, holding that
-  table's items. We only creates/drops these for now; Later on we'll add the
-  item read/write methods.
+  table's items. Phase 3a creates/drops these; Phase 3b adds single-item
+  reads and writes (put/get/delete by primary key).
 
 Plain Python exceptions and dataclasses in, plain Python exceptions and
 dataclasses out - no FastAPI or wire-protocol types here, mirroring
@@ -37,6 +40,7 @@ from sqlalchemy import (
     func,
     insert,
     select,
+    update,
 )
 
 from app.persistence.db import get_engine
@@ -91,6 +95,15 @@ def _physical_table_name(table_name: str) -> str:
     return f"ddb_item_{sanitized}_{digest}"
 
 
+def _composite_key(pk_value: str, sk_value: str | None) -> str:
+    """Encode a primary key as the single string the item table is keyed on.
+
+    JSON encoding keeps it unambiguous: joining with a separator such as `|`
+    would map (pk="a|b", sk="c") and (pk="a", sk="b|c") to the same string.
+    """
+    return json.dumps([pk_value] if sk_value is None else [pk_value, sk_value])
+
+
 class DynamoDbStorage:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -124,8 +137,8 @@ class DynamoDbStorage:
             physical_name,
             self._metadata,
             # pk_value/sk_value are stored alongside the JSON blob (not just
-            # inside it) so Query/Scan (Phase 3c) can filter/sort in SQL
-            # rather than deserializing every row's JSON in Python.
+            # inside it) so Query (Phase 3c) can select one partition in SQL
+            # without deserializing every row's JSON.
             Column("pk_value", String, nullable=False),
             Column("sk_value", String, nullable=True),
             Column("composite_key", String, primary_key=True),
@@ -242,6 +255,68 @@ class DynamoDbStorage:
         self._item_tables.pop(name, None)
 
         return table_def
+
+    # -- Items --------------------------------------------------------------
+
+    def _require_item_table(self, table_name: str) -> Table:
+        item_table = self._item_tables.get(table_name)
+        if item_table is None:
+            raise TableNotFound(table_name)
+        return item_table
+
+    def put_item(
+        self, table_name: str, pk_value: str, sk_value: str | None, item: dict
+    ) -> dict | None:
+        """Store `item`, replacing any item with the same key.
+
+        Returns the item that was replaced, or None if the key was new.
+        Read and write share one transaction so the returned old item is the
+        one actually overwritten.
+        """
+        item_table = self._require_item_table(table_name)
+        composite_key = _composite_key(pk_value, sk_value)
+        with self._engine.begin() as conn:
+            old_row = conn.execute(
+                select(item_table.c.item_json).where(item_table.c.composite_key == composite_key)
+            ).fetchone()
+            if old_row is None:
+                conn.execute(
+                    insert(item_table).values(
+                        composite_key=composite_key,
+                        pk_value=pk_value,
+                        sk_value=sk_value,
+                        item_json=json.dumps(item),
+                    )
+                )
+            else:
+                conn.execute(
+                    update(item_table)
+                    .where(item_table.c.composite_key == composite_key)
+                    .values(item_json=json.dumps(item))
+                )
+        return json.loads(old_row.item_json) if old_row is not None else None
+
+    def get_item(self, table_name: str, pk_value: str, sk_value: str | None) -> dict | None:
+        item_table = self._require_item_table(table_name)
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(item_table.c.item_json).where(
+                    item_table.c.composite_key == _composite_key(pk_value, sk_value)
+                )
+            ).fetchone()
+        return json.loads(row.item_json) if row is not None else None
+
+    def delete_item(self, table_name: str, pk_value: str, sk_value: str | None) -> dict | None:
+        """Remove the item with this key; returns it, or None if there was none."""
+        item_table = self._require_item_table(table_name)
+        composite_key = _composite_key(pk_value, sk_value)
+        with self._engine.begin() as conn:
+            old_row = conn.execute(
+                select(item_table.c.item_json).where(item_table.c.composite_key == composite_key)
+            ).fetchone()
+            if old_row is not None:
+                conn.execute(delete(item_table).where(item_table.c.composite_key == composite_key))
+        return json.loads(old_row.item_json) if old_row is not None else None
 
     def count_items(self, name: str) -> int:
         item_table = self._item_tables.get(name)

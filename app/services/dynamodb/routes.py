@@ -1,8 +1,9 @@
 """DynamoDB action handlers for the AWS JSON protocol.
 
-Now: table lifecycle only - CreateTable, DeleteTable,
-DescribeTable, ListTables. PutItem/GetItem/Query/Scan/UpdateItem etc. land
-in later sub-phases once this storage plumbing is in place.
+Implemented so far: table lifecycle (CreateTable, DeleteTable,
+DescribeTable, ListTables) and single-item CRUD by primary key
+(PutItem, GetItem, DeleteItem). Query/Scan, UpdateItem and
+conditional writes land in later sub-phases.
 
 Dispatch itself (reading `X-Amz-Target`, routing to this module) lives in
 `app.gateway.router`, the same shape SQS already established: this module
@@ -15,6 +16,8 @@ from __future__ import annotations
 from typing import Callable
 
 from app.gateway.errors import EmulatorError
+from app.services.dynamodb.attribute_values import DynamoValidationError, normalize_item
+from app.services.dynamodb.keys import extract_item_key, extract_request_key
 from app.services.dynamodb.models import TableDefinition
 from app.services.dynamodb.storage import DynamoDbStorage, TableAlreadyExists, TableNotFound
 
@@ -166,11 +169,74 @@ def _handle_list_tables(body: dict, storage: DynamoDbStorage) -> dict:
     return response
 
 
+_CONDITION_PARAMS = ("ConditionExpression", "Expected", "ConditionalOperator")
+_PROJECTION_PARAMS = ("ProjectionExpression", "AttributesToGet")
+
+
+def _reject_unsupported(body: dict, params: tuple[str, ...], planned_phase: str) -> None:
+    # Failing loudly beats ignoring: a silently dropped ConditionExpression
+    # would turn a "write only if absent" into an unconditional overwrite.
+    for param in params:
+        if param in body:
+            raise ValidationException(
+                f"{param} is not supported by this emulator yet "
+                f"(planned for Phase {planned_phase})."
+            )
+
+
+def _require_table(name: str, storage: DynamoDbStorage) -> TableDefinition:
+    table_def = storage.describe_table(name)
+    if table_def is None:
+        raise ResourceNotFoundException("Requested resource not found")
+    return table_def
+
+
+def _wants_old_values(body: dict) -> bool:
+    mode = body.get("ReturnValues", "NONE")
+    if mode not in ("NONE", "ALL_OLD"):
+        raise ValidationException("ReturnValues can only be ALL_OLD or NONE")
+    return bool(mode == "ALL_OLD")
+
+
+def _handle_put_item(body: dict, storage: DynamoDbStorage) -> dict:
+    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
+    table_def = _require_table(body["TableName"], storage)
+    item = normalize_item(body["Item"])
+    pk_value, sk_value = extract_item_key(table_def, item)
+    return_old = _wants_old_values(body)
+
+    old_item = storage.put_item(table_def.name, pk_value, sk_value, item)
+    return {"Attributes": old_item} if return_old and old_item is not None else {}
+
+
+def _handle_get_item(body: dict, storage: DynamoDbStorage) -> dict:
+    _reject_unsupported(body, _PROJECTION_PARAMS, "3c")
+    table_def = _require_table(body["TableName"], storage)
+    pk_value, sk_value = extract_request_key(table_def, body["Key"])
+
+    item = storage.get_item(table_def.name, pk_value, sk_value)
+    return {"Item": item} if item is not None else {}
+
+
+def _handle_delete_item(body: dict, storage: DynamoDbStorage) -> dict:
+    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
+    table_def = _require_table(body["TableName"], storage)
+    pk_value, sk_value = extract_request_key(table_def, body["Key"])
+    return_old = _wants_old_values(body)
+
+    # Deleting a missing key is not an error in real DynamoDB, same as S3.
+    old_item = storage.delete_item(table_def.name, pk_value, sk_value)
+    return {"Attributes": old_item} if return_old and old_item is not None else {}
+
+
 _ACTIONS: dict[str, Callable[[dict, DynamoDbStorage], dict]] = {
     "CreateTable": _handle_create_table,
     "DeleteTable": _handle_delete_table,
     "DescribeTable": _handle_describe_table,
     "ListTables": _handle_list_tables,
+    "PutItem": _handle_put_item,
+    "GetItem": _handle_get_item,
+    "DeleteItem": _handle_delete_item,
 }
 
 
@@ -184,7 +250,12 @@ def dispatch(action: str, body: dict, storage: DynamoDbStorage) -> dict:
     if handler is None:
         raise UnknownOperationException(
             f"The action {action} is not valid for this endpoint. "
-            "(Phase 3a implements table lifecycle only - item operations "
-            "land in later sub-phases.)"
+            "(Not implemented yet - see the roadmap for the remaining Phase 3 sub-phases.)"
         )
-    return handler(body, storage)
+    try:
+        return handler(body, storage)
+    except DynamoValidationError as exc:
+        raise ValidationException(str(exc)) from None
+    except TableNotFound:
+        # A table dropped between the existence check and the storage call.
+        raise ResourceNotFoundException("Requested resource not found") from None
