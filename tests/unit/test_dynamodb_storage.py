@@ -78,7 +78,7 @@ def test_describe_table_returns_none_when_missing(storage: DynamoDbStorage) -> N
 
 
 def test_delete_table_removes_it_and_its_physical_storage(storage: DynamoDbStorage) -> None:
-    table_def = _create_simple_table(storage)
+    _create_simple_table(storage)
     storage.delete_table("orders")
 
     assert storage.describe_table("orders") is None
@@ -139,3 +139,110 @@ def test_count_items_is_zero_for_empty_table(storage: DynamoDbStorage) -> None:
 
 def test_count_items_is_zero_for_unknown_table(storage: DynamoDbStorage) -> None:
     assert storage.count_items("does-not-exist") == 0
+
+
+# -- Items (Phase 3b) -----------------------------------------------------
+
+
+def _create_composite_table(storage: DynamoDbStorage, name: str = "events") -> None:
+    storage.create_table(
+        name=name,
+        partition_key="user_id",
+        partition_key_type="S",
+        sort_key="ts",
+        sort_key_type="S",
+        attribute_definitions=[
+            {"AttributeName": "user_id", "AttributeType": "S"},
+            {"AttributeName": "ts", "AttributeType": "S"},
+        ],
+        billing_mode="PAY_PER_REQUEST",
+        read_capacity_units=None,
+        write_capacity_units=None,
+    )
+
+
+def test_put_then_get_round_trips_the_item(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    item = {"order_id": {"S": "1"}, "total": {"N": "9.5"}}
+
+    assert storage.put_item("orders", "1", None, item) is None
+    assert storage.get_item("orders", "1", None) == item
+
+
+def test_get_missing_item_returns_none(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    assert storage.get_item("orders", "nope", None) is None
+
+
+def test_put_replaces_the_whole_item_and_returns_the_old_one(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    old = {"order_id": {"S": "1"}, "a": {"S": "x"}}
+    new = {"order_id": {"S": "1"}, "b": {"S": "y"}}
+    storage.put_item("orders", "1", None, old)
+
+    assert storage.put_item("orders", "1", None, new) == old
+    assert storage.get_item("orders", "1", None) == new
+    assert storage.count_items("orders") == 1
+
+
+def test_delete_item_returns_the_old_item_and_removes_it(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    item = {"order_id": {"S": "1"}}
+    storage.put_item("orders", "1", None, item)
+
+    assert storage.delete_item("orders", "1", None) == item
+    assert storage.get_item("orders", "1", None) is None
+
+
+def test_delete_missing_item_is_a_no_op(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    assert storage.delete_item("orders", "nope", None) is None
+
+
+def test_keys_that_would_collide_under_a_naive_separator_stay_distinct(
+    storage: DynamoDbStorage,
+) -> None:
+    _create_composite_table(storage)
+    first = {"user_id": {"S": "a|b"}, "ts": {"S": "c"}, "which": {"S": "first"}}
+    second = {"user_id": {"S": "a"}, "ts": {"S": "b|c"}, "which": {"S": "second"}}
+    storage.put_item("events", "a|b", "c", first)
+    storage.put_item("events", "a", "b|c", second)
+
+    assert storage.get_item("events", "a|b", "c") == first
+    assert storage.get_item("events", "a", "b|c") == second
+    assert storage.count_items("events") == 2
+
+
+def test_same_partition_key_different_sort_keys_are_separate_items(
+    storage: DynamoDbStorage,
+) -> None:
+    _create_composite_table(storage)
+    storage.put_item("events", "u1", "t1", {"user_id": {"S": "u1"}, "ts": {"S": "t1"}})
+    storage.put_item("events", "u1", "t2", {"user_id": {"S": "u1"}, "ts": {"S": "t2"}})
+    assert storage.count_items("events") == 2
+
+
+def test_item_operations_raise_for_unknown_table(storage: DynamoDbStorage) -> None:
+    with pytest.raises(TableNotFound):
+        storage.put_item("missing", "1", None, {})
+    with pytest.raises(TableNotFound):
+        storage.get_item("missing", "1", None)
+    with pytest.raises(TableNotFound):
+        storage.delete_item("missing", "1", None)
+
+
+def test_size_estimate_grows_once_items_are_stored(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    assert storage.estimate_size_bytes("orders") == 0
+    storage.put_item("orders", "1", None, {"order_id": {"S": "1"}})
+    assert storage.estimate_size_bytes("orders") > 0
+
+
+def test_recreated_table_starts_empty(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    storage.put_item("orders", "1", None, {"order_id": {"S": "1"}})
+    storage.delete_table("orders")
+    _create_simple_table(storage)
+
+    assert storage.get_item("orders", "1", None) is None
+    assert storage.count_items("orders") == 0
