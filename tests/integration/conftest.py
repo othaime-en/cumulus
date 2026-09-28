@@ -23,6 +23,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
 from app.main import app
+from app.services.dynamodb.storage import DynamoDbStorage, get_dynamodb_storage
 from app.services.s3.storage import S3Storage, get_s3_storage
 from app.services.sqs.storage import SqsStorage, get_sqs_storage
 
@@ -116,6 +117,39 @@ def sqs_storage() -> Iterator[SqsStorage]:
 def sqs_client(server_port: int, sqs_storage: SqsStorage) -> BaseClient:
     return boto3.client(
         "sqs",
+        endpoint_url=f"http://127.0.0.1:{server_port}",
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-east-1",
+    )
+
+
+@pytest.fixture
+def dynamodb_storage() -> Iterator[DynamoDbStorage]:
+    """Give each test its own isolated, empty DynamoDB database.
+
+    Same in-memory-plus-StaticPool approach as `sqs_storage`, for the same
+    reason: DynamoDB's state here is fully relational (registry table +
+    per-table item tables), nothing on-disk needs a real file, and
+    StaticPool keeps the server thread and the test thread looking at the
+    same `:memory:` database instead of SQLite's default one-per-connection
+    behavior.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    storage = DynamoDbStorage(engine=engine)
+    app.dependency_overrides[get_dynamodb_storage] = lambda: storage
+    yield storage
+    app.dependency_overrides.pop(get_dynamodb_storage, None)
+
+
+@pytest.fixture
+def dynamodb_client(server_port: int, dynamodb_storage: DynamoDbStorage) -> BaseClient:
+    return boto3.client(
+        "dynamodb",
         endpoint_url=f"http://127.0.0.1:{server_port}",
         aws_access_key_id="test",
         aws_secret_access_key="test",
