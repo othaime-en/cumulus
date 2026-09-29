@@ -15,6 +15,7 @@ binary are canonical and "1" / "1.0" map to the same key string.
 from __future__ import annotations
 
 import base64
+from decimal import Decimal
 from typing import Any
 
 from app.services.dynamodb.attribute_values import (
@@ -47,7 +48,7 @@ def _key_string(name: str, value: dict[str, Any], size_limit: int, limit_message
     return str(raw)
 
 
-def _partition_string(table: TableDefinition, value: dict[str, Any]) -> str:
+def partition_key_string(table: TableDefinition, value: dict[str, Any]) -> str:
     return _key_string(
         table.partition_key,
         value,
@@ -57,7 +58,7 @@ def _partition_string(table: TableDefinition, value: dict[str, Any]) -> str:
     )
 
 
-def _sort_string(table: TableDefinition, value: dict[str, Any]) -> str:
+def sort_key_string(table: TableDefinition, value: dict[str, Any]) -> str:
     return _key_string(
         str(table.sort_key),
         value,
@@ -65,6 +66,40 @@ def _sort_string(table: TableDefinition, value: dict[str, Any]) -> str:
         f"{INVALID_PREFIX}Aggregated size of all range keys has exceeded the size limit of "
         f"{MAX_SORT_KEY_BYTES} bytes",
     )
+
+
+def sort_comparable(table: TableDefinition, text: str | None) -> Any:
+    """A value that orders like the table's sort key type does in DynamoDB:
+    strings by code point (== UTF-8 byte order), numbers numerically, binary
+    by bytes. Tables without a sort key all compare equal.
+
+    Sorting happens in Python because the stored key text can't order
+    numbers (or base64 binary) correctly in SQL.
+    """
+    if table.sort_key is None or text is None:
+        return 0
+    if table.sort_key_type == "N":
+        return Decimal(text)
+    if table.sort_key_type == "B":
+        return base64.b64decode(text)
+    return text
+
+
+def item_sort_comparable(table: TableDefinition, item: dict[str, dict[str, Any]]) -> Any:
+    if table.sort_key is None:
+        return 0
+    ((_, raw),) = item[table.sort_key].items()
+    return sort_comparable(table, str(raw))
+
+
+def item_key_attributes(
+    table: TableDefinition, item: dict[str, dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """The key attributes of an item, in wire format (for LastEvaluatedKey)."""
+    key = {table.partition_key: item[table.partition_key]}
+    if table.sort_key is not None:
+        key[table.sort_key] = item[table.sort_key]
+    return key
 
 
 def extract_item_key(
@@ -85,8 +120,8 @@ def extract_item_key(
                 f"actual: {actual_type}"
             )
 
-    partition = _partition_string(table, item[table.partition_key])
-    sort = _sort_string(table, item[table.sort_key]) if table.sort_key is not None else None
+    partition = partition_key_string(table, item[table.partition_key])
+    sort = sort_key_string(table, item[table.sort_key]) if table.sort_key is not None else None
     return partition, sort
 
 
@@ -102,6 +137,8 @@ def extract_request_key(table: TableDefinition, key: Any) -> tuple[str, str | No
         if next(iter(normalized[name])) != expected_type:
             raise DynamoValidationError(_SCHEMA_MISMATCH)
 
-    partition = _partition_string(table, normalized[table.partition_key])
-    sort = _sort_string(table, normalized[table.sort_key]) if table.sort_key is not None else None
+    partition = partition_key_string(table, normalized[table.partition_key])
+    sort = None
+    if table.sort_key is not None:
+        sort = sort_key_string(table, normalized[table.sort_key])
     return partition, sort
