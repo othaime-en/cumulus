@@ -1,9 +1,10 @@
 """DynamoDB action handlers for the AWS JSON protocol.
 
 Implemented so far: table lifecycle (CreateTable, DeleteTable,
-DescribeTable, ListTables) and single-item CRUD by primary key
-(PutItem, GetItem, DeleteItem). Query/Scan, UpdateItem and
-conditional writes land in later sub-phases.
+DescribeTable, ListTables), single-item CRUD by primary key
+(PutItem, GetItem, DeleteItem), and Query/Scan with filters and
+projections. UpdateItem and conditional writes land in later
+sub-phases.
 
 Dispatch itself (reading `X-Amz-Target`, routing to this module) lives in
 `app.gateway.router`, the same shape SQS already established: this module
@@ -17,8 +18,15 @@ from typing import Callable
 
 from app.gateway.errors import EmulatorError
 from app.services.dynamodb.attribute_values import DynamoValidationError, normalize_item
+from app.services.dynamodb.expression_parser import ExpressionContext
 from app.services.dynamodb.keys import extract_item_key, extract_request_key
 from app.services.dynamodb.models import TableDefinition
+from app.services.dynamodb.projection import (
+    project_item,
+    reject_mixed_parameters,
+    resolve_projection,
+)
+from app.services.dynamodb.query import execute_query, execute_scan
 from app.services.dynamodb.storage import DynamoDbStorage, TableAlreadyExists, TableNotFound
 
 # Real DynamoDB's own ListTables page size cap when the caller doesn't pass
@@ -170,7 +178,6 @@ def _handle_list_tables(body: dict, storage: DynamoDbStorage) -> dict:
 
 
 _CONDITION_PARAMS = ("ConditionExpression", "Expected", "ConditionalOperator")
-_PROJECTION_PARAMS = ("ProjectionExpression", "AttributesToGet")
 
 
 def _reject_unsupported(body: dict, params: tuple[str, ...], planned_phase: str) -> None:
@@ -210,12 +217,18 @@ def _handle_put_item(body: dict, storage: DynamoDbStorage) -> dict:
 
 
 def _handle_get_item(body: dict, storage: DynamoDbStorage) -> dict:
-    _reject_unsupported(body, _PROJECTION_PARAMS, "3c")
+    reject_mixed_parameters(body, ("AttributesToGet",), ("ProjectionExpression",))
+    context = ExpressionContext(body.get("ExpressionAttributeNames"))
+    projection = resolve_projection(body, context)
+    context.check_all_used()
+
     table_def = _require_table(body["TableName"], storage)
     pk_value, sk_value = extract_request_key(table_def, body["Key"])
 
     item = storage.get_item(table_def.name, pk_value, sk_value)
-    return {"Item": item} if item is not None else {}
+    if item is None:
+        return {}
+    return {"Item": project_item(item, projection) if projection else item}
 
 
 def _handle_delete_item(body: dict, storage: DynamoDbStorage) -> dict:
@@ -229,6 +242,16 @@ def _handle_delete_item(body: dict, storage: DynamoDbStorage) -> dict:
     return {"Attributes": old_item} if return_old and old_item is not None else {}
 
 
+def _handle_query(body: dict, storage: DynamoDbStorage) -> dict:
+    table_def = _require_table(body["TableName"], storage)
+    return execute_query(body, table_def, storage)
+
+
+def _handle_scan(body: dict, storage: DynamoDbStorage) -> dict:
+    table_def = _require_table(body["TableName"], storage)
+    return execute_scan(body, table_def, storage)
+
+
 _ACTIONS: dict[str, Callable[[dict, DynamoDbStorage], dict]] = {
     "CreateTable": _handle_create_table,
     "DeleteTable": _handle_delete_table,
@@ -237,6 +260,8 @@ _ACTIONS: dict[str, Callable[[dict, DynamoDbStorage], dict]] = {
     "PutItem": _handle_put_item,
     "GetItem": _handle_get_item,
     "DeleteItem": _handle_delete_item,
+    "Query": _handle_query,
+    "Scan": _handle_scan,
 }
 
 
