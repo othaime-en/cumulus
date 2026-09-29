@@ -246,3 +246,45 @@ def test_recreated_table_starts_empty(storage: DynamoDbStorage) -> None:
 
     assert storage.get_item("orders", "1", None) is None
     assert storage.count_items("orders") == 0
+
+
+# -- Bulk reads (Phase 3c) --------------------------------------------------
+
+
+def test_list_partition_returns_only_that_partitions_items(storage: DynamoDbStorage) -> None:
+    _create_composite_table(storage)
+    for user, ts in (("u1", "a"), ("u1", "b"), ("u2", "a")):
+        storage.put_item("events", user, ts, {"user_id": {"S": user}, "ts": {"S": ts}})
+
+    items = storage.list_partition("events", "u1")
+    assert sorted(item["ts"]["S"] for item in items) == ["a", "b"]
+    assert storage.list_partition("events", "nobody") == []
+
+
+def test_list_items_is_ordered_and_resumable(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    for order_id in ("c", "a", "b", "d"):
+        storage.put_item("orders", order_id, None, {"order_id": {"S": order_id}})
+
+    everything = storage.list_items("orders", after=None, limit=None)
+    assert [item["order_id"]["S"] for item in everything] == ["a", "b", "c", "d"]
+
+    page = storage.list_items("orders", after=("b", None), limit=1)
+    assert [item["order_id"]["S"] for item in page] == ["c"]
+
+
+def test_list_items_resumes_after_a_deleted_key(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    for order_id in ("a", "b", "c"):
+        storage.put_item("orders", order_id, None, {"order_id": {"S": order_id}})
+    storage.delete_item("orders", "b", None)
+
+    remaining = storage.list_items("orders", after=("b", None), limit=None)
+    assert [item["order_id"]["S"] for item in remaining] == ["c"]
+
+
+def test_bulk_reads_raise_for_unknown_table(storage: DynamoDbStorage) -> None:
+    with pytest.raises(TableNotFound):
+        storage.list_partition("missing", "x")
+    with pytest.raises(TableNotFound):
+        storage.list_items("missing", after=None, limit=None)
