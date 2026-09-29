@@ -198,3 +198,52 @@ def normalize_item(item: Any) -> dict[str, dict[str, Any]]:
         _check_attribute_name(name): normalize_attribute_value(value)
         for name, value in item.items()
     }
+
+
+def values_equal(first: dict[str, Any] | None, second: dict[str, Any] | None) -> bool:
+    """DynamoDB equality: same type and same value; sets compare unordered.
+
+    Both sides must already be normalized. A missing value (None) is never
+    equal to anything.
+    """
+    if first is None or second is None:
+        return False
+    ((first_type, first_raw),) = first.items()
+    ((second_type, second_raw),) = second.items()
+    if first_type != second_type:
+        return False
+    if first_type in _SET_KINDS:
+        return set(first_raw) == set(second_raw)
+    if first_type == "M":
+        return first_raw.keys() == second_raw.keys() and all(
+            values_equal(child, second_raw[name]) for name, child in first_raw.items()
+        )
+    if first_type == "L":
+        return len(first_raw) == len(second_raw) and all(
+            values_equal(a, b) for a, b in zip(first_raw, second_raw, strict=True)
+        )
+    return bool(first_raw == second_raw)
+
+
+def compare_values(first: dict[str, Any] | None, second: dict[str, Any] | None) -> int | None:
+    """Three-way comparison for S, N and B values of the same type.
+
+    Returns None when the two values can't be ordered (missing, different
+    types, or a type that has no ordering) - callers treat that as "the
+    comparison is false".
+    """
+    if first is None or second is None:
+        return None
+    ((first_type, first_raw),) = first.items()
+    ((second_type, second_raw),) = second.items()
+    if first_type != second_type or first_type not in ("S", "N", "B"):
+        return None
+    left: Any
+    right: Any
+    if first_type == "N":
+        left, right = Decimal(first_raw), Decimal(second_raw)
+    elif first_type == "B":
+        left, right = base64.b64decode(first_raw), base64.b64decode(second_raw)
+    else:
+        left, right = first_raw, second_raw
+    return (left > right) - (left < right)
