@@ -12,7 +12,8 @@ Two tiers of state:
   each table's metadata - key schema, attribute types, billing mode, etc.
 - one dynamically-created physical table per DynamoDB table, holding that
   table's items. Phase 3a creates/drops these; Phase 3b adds single-item
-  reads and writes (put/get/delete by primary key).
+  reads and writes (put/get/delete by primary key); Phase 3c adds the bulk
+  reads behind Query (one partition) and Scan (whole table, resumable).
 
 Plain Python exceptions and dataclasses in, plain Python exceptions and
 dataclasses out - no FastAPI or wire-protocol types here, mirroring
@@ -126,6 +127,11 @@ class DynamoDbStorage:
                 row.physical_table_name
             )
         self._metadata.create_all(self._engine)
+        # create_all skips tables that already exist, so item tables created
+        # before their pk_value index was introduced (Phase 3c) get it here.
+        for item_table in self._item_tables.values():
+            for index in item_table.indexes:
+                index.create(self._engine, checkfirst=True)
 
     def _get_or_define_item_table(self, physical_name: str) -> Table:
         # A Table with a given name can only be declared once per MetaData;
@@ -139,7 +145,7 @@ class DynamoDbStorage:
             # pk_value/sk_value are stored alongside the JSON blob (not just
             # inside it) so Query (Phase 3c) can select one partition in SQL
             # without deserializing every row's JSON.
-            Column("pk_value", String, nullable=False),
+            Column("pk_value", String, nullable=False, index=True),
             Column("sk_value", String, nullable=True),
             Column("composite_key", String, primary_key=True),
             Column("item_json", String, nullable=False),
@@ -317,6 +323,41 @@ class DynamoDbStorage:
             if old_row is not None:
                 conn.execute(delete(item_table).where(item_table.c.composite_key == composite_key))
         return json.loads(old_row.item_json) if old_row is not None else None
+
+    def list_partition(self, table_name: str, pk_value: str) -> list[dict]:
+        """Every item sharing this partition key, in no particular order.
+
+        Ordering by sort key is the caller's job: the stored key text can't
+        order numbers or binary correctly, so it happens in Python with typed
+        values (see `keys.sort_comparable`).
+        """
+        item_table = self._require_item_table(table_name)
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                select(item_table.c.item_json).where(item_table.c.pk_value == pk_value)
+            ).fetchall()
+        return [json.loads(row.item_json) for row in rows]
+
+    def list_items(
+        self,
+        table_name: str,
+        after: tuple[str, str | None] | None,
+        limit: int | None,
+    ) -> list[dict]:
+        """Items in stored-key order, optionally resuming after a key.
+
+        `after` is a (pk_value, sk_value) pair; that item itself is excluded,
+        whether or not it still exists.
+        """
+        item_table = self._require_item_table(table_name)
+        statement = select(item_table.c.item_json).order_by(item_table.c.composite_key)
+        if after is not None:
+            statement = statement.where(item_table.c.composite_key > _composite_key(*after))
+        if limit is not None:
+            statement = statement.limit(limit)
+        with self._engine.connect() as conn:
+            rows = conn.execute(statement).fetchall()
+        return [json.loads(row.item_json) for row in rows]
 
     def count_items(self, name: str) -> int:
         item_table = self._item_tables.get(name)

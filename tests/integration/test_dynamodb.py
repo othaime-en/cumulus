@@ -1,6 +1,6 @@
 """Integration tests for the DynamoDB emulator, driven by a real boto3 client.
 
-Covers table lifecycle (Phase 3a) and single-item CRUD (Phase 3b). No
+Covers table lifecycle (3a), single-item CRUD (3b) and Query/Scan (3c). No
 special boto3 Config is needed — DynamoDB has used the AWS JSON protocol
 since GA, so current botocore already sends what this emulator expects.
 """
@@ -340,16 +340,6 @@ def test_condition_expressions_are_rejected_rather_than_ignored(dynamodb_client,
     assert dynamodb_client.describe_table(TableName=orders_table)["Table"]["ItemCount"] == 0
 
 
-def test_projection_is_rejected_rather_than_ignored(dynamodb_client, orders_table):
-    with pytest.raises(ClientError) as exc_info:
-        dynamodb_client.get_item(
-            TableName=orders_table,
-            Key={"order_id": {"S": "1"}},
-            ProjectionExpression="order_id",
-        )
-    assert _error_code(exc_info) == "ValidationException"
-
-
 def test_describe_table_item_count_tracks_writes(dynamodb_client, orders_table):
     for order_id in ("1", "2", "3"):
         dynamodb_client.put_item(TableName=orders_table, Item={"order_id": {"S": order_id}})
@@ -358,3 +348,292 @@ def test_describe_table_item_count_tracks_writes(dynamodb_client, orders_table):
     table = dynamodb_client.describe_table(TableName=orders_table)["Table"]
     assert table["ItemCount"] == 2
     assert table["TableSizeBytes"] > 0
+
+
+# -- GetItem projection, Query and Scan (Phase 3c) --------------------------
+
+
+@pytest.fixture
+def logs_table(dynamodb_client):
+    """String sort key, for begins_with and lexicographic ordering."""
+    dynamodb_client.create_table(
+        TableName="logs",
+        KeySchema=[
+            {"AttributeName": "app", "KeyType": "HASH"},
+            {"AttributeName": "stamp", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "app", "AttributeType": "S"},
+            {"AttributeName": "stamp", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    for stamp in ("2026-01-01", "2026-01-15", "2026-02-01", "2027-01-01"):
+        dynamodb_client.put_item(
+            TableName="logs",
+            Item={"app": {"S": "web"}, "stamp": {"S": stamp}, "level": {"S": "info"}},
+        )
+    dynamodb_client.put_item(
+        TableName="logs",
+        Item={"app": {"S": "web"}, "stamp": {"S": "2026-03-01"}, "level": {"S": "error"}},
+    )
+    dynamodb_client.put_item(
+        TableName="logs", Item={"app": {"S": "api"}, "stamp": {"S": "2026-01-01"}}
+    )
+    return "logs"
+
+
+@pytest.fixture
+def filled_events(dynamodb_client, events_table):
+    for seq in (10, 2, 1, 33):
+        dynamodb_client.put_item(
+            TableName=events_table,
+            Item={
+                "user_id": {"S": "u1"},
+                "seq": {"N": str(seq)},
+                "kind": {"S": "even" if seq % 2 == 0 else "odd"},
+            },
+        )
+    dynamodb_client.put_item(
+        TableName=events_table,
+        Item={"user_id": {"S": "u2"}, "seq": {"N": "5"}, "kind": {"S": "odd"}},
+    )
+    return events_table
+
+
+def _seqs(response) -> list[str]:
+    return [item["seq"]["N"] for item in response["Items"]]
+
+
+def test_get_item_with_projection_expression(dynamodb_client, orders_table):
+    dynamodb_client.put_item(
+        TableName=orders_table,
+        Item={
+            "order_id": {"S": "1"},
+            "status": {"S": "open"},
+            "shipping": {"M": {"city": {"S": "Mwanza"}, "zip": {"S": "33"}}},
+        },
+    )
+    response = dynamodb_client.get_item(
+        TableName=orders_table,
+        Key={"order_id": {"S": "1"}},
+        ProjectionExpression="#s, shipping.city",
+        ExpressionAttributeNames={"#s": "status"},
+    )
+    assert response["Item"] == {
+        "status": {"S": "open"},
+        "shipping": {"M": {"city": {"S": "Mwanza"}}},
+    }
+
+
+def test_get_item_with_legacy_attributes_to_get(dynamodb_client, orders_table):
+    dynamodb_client.put_item(
+        TableName=orders_table, Item={"order_id": {"S": "1"}, "a": {"S": "x"}, "b": {"S": "y"}}
+    )
+    response = dynamodb_client.get_item(
+        TableName=orders_table, Key={"order_id": {"S": "1"}}, AttributesToGet=["a"]
+    )
+    assert response["Item"] == {"a": {"S": "x"}}
+
+
+def test_query_returns_items_in_numeric_sort_key_order(dynamodb_client, filled_events):
+    response = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u",
+        ExpressionAttributeValues={":u": {"S": "u1"}},
+    )
+    assert _seqs(response) == ["1", "2", "10", "33"]
+    assert response["Count"] == 4
+    assert response["ScannedCount"] == 4
+
+
+def test_query_reverse_and_sort_key_conditions(dynamodb_client, filled_events):
+    reverse = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u",
+        ExpressionAttributeValues={":u": {"S": "u1"}},
+        ScanIndexForward=False,
+    )
+    assert _seqs(reverse) == ["33", "10", "2", "1"]
+
+    between = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u AND seq BETWEEN :lo AND :hi",
+        ExpressionAttributeValues={":u": {"S": "u1"}, ":lo": {"N": "2"}, ":hi": {"N": "10"}},
+    )
+    assert _seqs(between) == ["2", "10"]
+
+
+def test_query_begins_with_on_string_sort_key(dynamodb_client, logs_table):
+    response = dynamodb_client.query(
+        TableName=logs_table,
+        KeyConditionExpression="app = :a AND begins_with(stamp, :p)",
+        ExpressionAttributeValues={":a": {"S": "web"}, ":p": {"S": "2026-01"}},
+    )
+    assert [item["stamp"]["S"] for item in response["Items"]] == ["2026-01-01", "2026-01-15"]
+
+
+def test_query_pagination_with_limit(dynamodb_client, filled_events):
+    request = {
+        "TableName": filled_events,
+        "KeyConditionExpression": "user_id = :u",
+        "ExpressionAttributeValues": {":u": {"S": "u1"}},
+        "Limit": 3,
+    }
+    first = dynamodb_client.query(**request)
+    assert _seqs(first) == ["1", "2", "10"]
+    assert first["LastEvaluatedKey"] == {"user_id": {"S": "u1"}, "seq": {"N": "10"}}
+
+    second = dynamodb_client.query(ExclusiveStartKey=first["LastEvaluatedKey"], **request)
+    assert _seqs(second) == ["33"]
+    assert "LastEvaluatedKey" not in second
+
+
+def test_query_filter_count_and_scanned_count(dynamodb_client, filled_events):
+    response = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u",
+        FilterExpression="kind = :k",
+        ExpressionAttributeValues={":u": {"S": "u1"}, ":k": {"S": "even"}},
+    )
+    assert _seqs(response) == ["2", "10"]
+    assert response["Count"] == 2
+    assert response["ScannedCount"] == 4
+
+    counted = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u",
+        ExpressionAttributeValues={":u": {"S": "u1"}},
+        Select="COUNT",
+    )
+    assert counted["Count"] == 4
+    assert "Items" not in counted
+
+
+def test_query_with_projection_expression(dynamodb_client, filled_events):
+    response = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditionExpression="user_id = :u",
+        ProjectionExpression="seq",
+        ExpressionAttributeValues={":u": {"S": "u2"}},
+    )
+    assert response["Items"] == [{"seq": {"N": "5"}}]
+
+
+def test_query_with_legacy_key_conditions_and_filter(dynamodb_client, filled_events):
+    response = dynamodb_client.query(
+        TableName=filled_events,
+        KeyConditions={
+            "user_id": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "u1"}]},
+            "seq": {"ComparisonOperator": "GE", "AttributeValueList": [{"N": "2"}]},
+        },
+        QueryFilter={"kind": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "odd"}]}},
+    )
+    assert _seqs(response) == ["33"]
+
+
+def test_query_rejects_reserved_words_used_as_attribute_names(dynamodb_client, logs_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.query(
+            TableName=logs_table,
+            KeyConditionExpression="app = :a",
+            FilterExpression="level = :l",
+            ExpressionAttributeValues={":a": {"S": "web"}, ":l": {"S": "error"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+    assert "reserved keyword" in str(exc_info.value)
+
+
+def test_query_accepts_reserved_words_through_aliases(dynamodb_client, logs_table):
+    response = dynamodb_client.query(
+        TableName=logs_table,
+        KeyConditionExpression="app = :a",
+        FilterExpression="#lvl = :l",
+        ExpressionAttributeNames={"#lvl": "level"},
+        ExpressionAttributeValues={":a": {"S": "web"}, ":l": {"S": "error"}},
+    )
+    assert [item["stamp"]["S"] for item in response["Items"]] == ["2026-03-01"]
+
+
+def test_query_rejects_unused_placeholders(dynamodb_client, filled_events):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.query(
+            TableName=filled_events,
+            KeyConditionExpression="user_id = :u",
+            ExpressionAttributeValues={":u": {"S": "u1"}, ":unused": {"S": "x"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+    assert "unused" in str(exc_info.value)
+
+
+def test_query_rejects_filters_on_key_attributes(dynamodb_client, filled_events):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.query(
+            TableName=filled_events,
+            KeyConditionExpression="user_id = :u",
+            FilterExpression="seq > :s",
+            ExpressionAttributeValues={":u": {"S": "u1"}, ":s": {"N": "1"}},
+        )
+    assert "non-primary key attributes" in str(exc_info.value)
+
+
+def test_query_on_a_missing_table_or_index(dynamodb_client, filled_events):
+    with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
+        dynamodb_client.query(
+            TableName="ghost",
+            KeyConditionExpression="id = :i",
+            ExpressionAttributeValues={":i": {"S": "1"}},
+        )
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.query(
+            TableName=filled_events,
+            IndexName="by-kind",
+            KeyConditionExpression="kind = :k",
+            ExpressionAttributeValues={":k": {"S": "odd"}},
+        )
+    assert "does not have the specified index" in str(exc_info.value)
+
+
+def test_scan_returns_every_item(dynamodb_client, filled_events):
+    response = dynamodb_client.scan(TableName=filled_events)
+    assert response["Count"] == 5
+    assert response["ScannedCount"] == 5
+
+
+def test_scan_filter_and_projection(dynamodb_client, filled_events):
+    response = dynamodb_client.scan(
+        TableName=filled_events,
+        FilterExpression="kind = :k AND seq > :s",
+        ProjectionExpression="user_id, seq",
+        ExpressionAttributeValues={":k": {"S": "odd"}, ":s": {"N": "1"}},
+    )
+    found = sorted((item["user_id"]["S"], item["seq"]["N"]) for item in response["Items"])
+    assert found == [("u1", "33"), ("u2", "5")]
+
+
+def test_scan_pagination_visits_every_item_once(dynamodb_client, filled_events):
+    seen = []
+    request = {"TableName": filled_events, "Limit": 2}
+    for _ in range(10):
+        response = dynamodb_client.scan(**request)
+        seen += [(item["user_id"]["S"], item["seq"]["N"]) for item in response["Items"]]
+        if "LastEvaluatedKey" not in response:
+            break
+        request["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+    assert sorted(seen) == [("u1", "1"), ("u1", "10"), ("u1", "2"), ("u1", "33"), ("u2", "5")]
+
+
+def test_scan_with_legacy_filter_and_count(dynamodb_client, filled_events):
+    response = dynamodb_client.scan(
+        TableName=filled_events,
+        ScanFilter={"kind": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "even"}]}},
+        Select="COUNT",
+    )
+    assert response["Count"] == 2
+    assert "Items" not in response
+
+
+def test_scan_rejects_parallel_segments(dynamodb_client, filled_events):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.scan(TableName=filled_events, Segment=0, TotalSegments=2)
+    assert _error_code(exc_info) == "ValidationException"
