@@ -34,6 +34,13 @@ from app.services.dynamodb.expression_parser import (
     Path,
     check_orderable,
 )
+from app.services.dynamodb.update_expression import (
+    Action,
+    AddAction,
+    DeleteAction,
+    RemoveAction,
+    SetAction,
+)
 
 _SIMPLE_OPERATORS = {"EQ": "=", "NE": "<>", "LE": "<=", "LT": "<", "GE": ">=", "GT": ">"}
 _ORDERING = {"LE", "LT", "GE", "GT"}
@@ -126,3 +133,47 @@ def legacy_filter_node(filter_map: Any, conditional_operator: Any, label: str) -
     for node in nodes[1:]:
         combined = And(combined, node) if joiner == "AND" else Or(combined, node)
     return combined
+
+
+# -- Legacy UpdateItem (AttributeUpdates) ------------------------------------
+
+
+def legacy_update_actions(attribute_updates: Any) -> list[Action]:
+    """Convert `AttributeUpdates` into the same Action nodes `update_expression`
+    produces, so both API generations run through one apply_update().
+
+    Only top-level attribute names are possible here (AttributeUpdates has no
+    notion of nested document paths), so there's no path-overlap check to do
+    - a plain dict can't repeat a key.
+    """
+    if not isinstance(attribute_updates, dict) or not attribute_updates:
+        raise DynamoValidationError(f"{INVALID_PREFIX}AttributeUpdates must not be empty")
+
+    actions: list[Action] = []
+    for attribute, spec in attribute_updates.items():
+        if not isinstance(spec, dict):
+            raise DynamoValidationError(f"{INVALID_PREFIX}Invalid AttributeValueUpdate")
+        action_name = spec.get("Action", "PUT")
+        raw_value = spec.get("Value")
+        path = Path((attribute,))
+
+        if action_name == "PUT":
+            if raw_value is None:
+                raise DynamoValidationError(
+                    f"{INVALID_PREFIX}Value must be specified for PUT Action"
+                )
+            actions.append(SetAction(path, Literal(normalize_attribute_value(raw_value))))
+        elif action_name == "DELETE":
+            if raw_value is None:
+                actions.append(RemoveAction(path))
+            else:
+                actions.append(DeleteAction(path, Literal(normalize_attribute_value(raw_value))))
+        elif action_name == "ADD":
+            if raw_value is None:
+                raise DynamoValidationError(
+                    f"{INVALID_PREFIX}Value must be specified for ADD Action"
+                )
+            actions.append(AddAction(path, Literal(normalize_attribute_value(raw_value))))
+        else:
+            raise DynamoValidationError(f"{INVALID_PREFIX}Unsupported Action: {action_name}")
+    return actions
