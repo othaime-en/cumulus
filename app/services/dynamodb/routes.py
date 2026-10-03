@@ -1,10 +1,10 @@
 """DynamoDB action handlers for the AWS JSON protocol.
 
 Implemented so far: table lifecycle (CreateTable, DeleteTable,
-DescribeTable, ListTables), single-item CRUD by primary key
-(PutItem, GetItem, DeleteItem), and Query/Scan with filters and
-projections. UpdateItem and conditional writes land in later
-sub-phases.
+DescribeTable, ListTables - Phase 3a), single-item CRUD by primary key
+(PutItem, GetItem, DeleteItem - Phase 3b), Query/Scan with filters and
+projections (Phase 3c), and UpdateItem with all four UpdateExpression
+clauses (Phase 3d). Conditional writes land in Phase 3e.
 
 Dispatch itself (reading `X-Amz-Target`, routing to this module) lives in
 `app.gateway.router`, the same shape SQS already established: this module
@@ -26,7 +26,14 @@ from app.services.dynamodb.projection import (
     reject_mixed_parameters,
     resolve_projection,
 )
+from app.services.dynamodb.legacy import legacy_update_actions
 from app.services.dynamodb.query import execute_query, execute_scan
+from app.services.dynamodb.update import (
+    apply_update,
+    touched_top_level_names,
+    validate_no_key_attribute_targets,
+)
+from app.services.dynamodb.update_expression import parse_update_expression
 from app.services.dynamodb.storage import DynamoDbStorage, TableAlreadyExists, TableNotFound
 
 # Real DynamoDB's own ListTables page size cap when the caller doesn't pass
@@ -242,6 +249,68 @@ def _handle_delete_item(body: dict, storage: DynamoDbStorage) -> dict:
     return {"Attributes": old_item} if return_old and old_item is not None else {}
 
 
+_UPDATE_RETURN_MODES = ("NONE", "ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATED_NEW")
+
+
+def _projected(item: dict, names: set[str]) -> dict:
+    return {name: item[name] for name in names if name in item}
+
+
+def _update_return_values(
+    mode: str, old_item: dict | None, new_item: dict, touched: set[str]
+) -> dict:
+    if mode == "NONE":
+        return {}
+    if mode == "ALL_OLD":
+        return {"Attributes": old_item} if old_item is not None else {}
+    if mode == "ALL_NEW":
+        return {"Attributes": new_item}
+    if mode == "UPDATED_OLD":
+        attrs = _projected(old_item, touched) if old_item is not None else {}
+        return {"Attributes": attrs} if attrs else {}
+    return {"Attributes": _projected(new_item, touched)}  # UPDATED_NEW
+
+
+def _handle_update_item(body: dict, storage: DynamoDbStorage) -> dict:
+    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
+    reject_mixed_parameters(body, ("AttributeUpdates",), ("UpdateExpression",))
+    table_def = _require_table(body["TableName"], storage)
+    pk_value, sk_value = extract_request_key(table_def, body["Key"])
+    # extract_request_key already proved body["Key"] has exactly the
+    # table's key attributes with the right types; normalize it so a
+    # freshly-created item (the upsert path below) stores the key in the
+    # same canonical form PutItem would, not whatever spelling the caller
+    # sent ("1.0" vs "1").
+    normalized_key = normalize_item(body["Key"])
+
+    context = ExpressionContext(
+        body.get("ExpressionAttributeNames"), body.get("ExpressionAttributeValues")
+    )
+    if "UpdateExpression" in body:
+        actions = parse_update_expression(body["UpdateExpression"], context)
+    elif "AttributeUpdates" in body:
+        actions = legacy_update_actions(body["AttributeUpdates"])
+    else:
+        raise ValidationException(
+            "Either the UpdateExpression or AttributeUpdates parameter must be specified "
+            "in the request."
+        )
+    context.check_all_used()
+    validate_no_key_attribute_targets(actions, table_def)
+
+    return_mode = body.get("ReturnValues", "NONE")
+    if return_mode not in _UPDATE_RETURN_MODES:
+        raise ValidationException(f"Return values set to invalid value: {return_mode}")
+
+    old_item = storage.get_item(table_def.name, pk_value, sk_value)
+    new_item = apply_update(table_def, old_item, normalized_key, actions)
+    new_pk, new_sk = extract_item_key(table_def, new_item)
+    storage.put_item(table_def.name, new_pk, new_sk, new_item)
+
+    touched = touched_top_level_names(actions)
+    return _update_return_values(return_mode, old_item, new_item, touched)
+
+
 def _handle_query(body: dict, storage: DynamoDbStorage) -> dict:
     table_def = _require_table(body["TableName"], storage)
     return execute_query(body, table_def, storage)
@@ -262,6 +331,7 @@ _ACTIONS: dict[str, Callable[[dict, DynamoDbStorage], dict]] = {
     "DeleteItem": _handle_delete_item,
     "Query": _handle_query,
     "Scan": _handle_scan,
+    "UpdateItem": _handle_update_item,
 }
 
 
