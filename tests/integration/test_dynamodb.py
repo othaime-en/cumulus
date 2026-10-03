@@ -135,7 +135,7 @@ def test_create_table_provisioned_requires_throughput(dynamodb_client):
         )
 
 
-# -- Items -----------------------------------------------------------------
+# -- Items (Phase 3b) -----------------------------------------------------
 
 
 @pytest.fixture
@@ -350,7 +350,7 @@ def test_describe_table_item_count_tracks_writes(dynamodb_client, orders_table):
     assert table["TableSizeBytes"] > 0
 
 
-# -- GetItem projection, Query and Scan ---------------------------------
+# -- GetItem projection, Query and Scan (Phase 3c) --------------------------
 
 
 @pytest.fixture
@@ -639,7 +639,7 @@ def test_scan_rejects_parallel_segments(dynamodb_client, filled_events):
     assert _error_code(exc_info) == "ValidationException"
 
 
-# -- UpdateItem ----------------------------------------------------------------
+# -- UpdateItem (Phase 3d) ---------------------------------------------------
 
 
 def test_update_item_creates_the_item_when_missing(dynamodb_client, orders_table):
@@ -721,11 +721,11 @@ def test_update_item_list_append(dynamodb_client, orders_table):
 
 def test_update_item_remove(dynamodb_client, orders_table):
     key = {"order_id": {"S": "1"}}
-    dynamodb_client.put_item(TableName=orders_table, Item={**key, "temp": {"S": "x"}})
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "scratch": {"S": "x"}})
     response = dynamodb_client.update_item(
-        TableName=orders_table, Key=key, UpdateExpression="REMOVE temp", ReturnValues="ALL_NEW"
+        TableName=orders_table, Key=key, UpdateExpression="REMOVE scratch", ReturnValues="ALL_NEW"
     )
-    assert "temp" not in response["Attributes"]
+    assert "scratch" not in response["Attributes"]
 
 
 def test_update_item_add_and_delete_on_a_set(dynamodb_client, orders_table):
