@@ -246,23 +246,28 @@ _TOKEN_PATTERN = re.compile(
       | (?P<value_placeholder>:[A-Za-z0-9_]+)
       | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
       | (?P<number>\d+)
-      | (?P<op><>|<=|>=|=|<|>)
+      | (?P<op><>|<=|>=|=|<|>|\+|-)
       | (?P<punct>[()\[\],.])
     )""",
     re.VERBOSE,
 )
-_KEYWORDS = {"AND", "OR", "NOT", "BETWEEN", "IN"}
+CONDITION_KEYWORDS = frozenset({"AND", "OR", "NOT", "BETWEEN", "IN"})
 
 
 @dataclass(frozen=True)
-class _Token:
+class Token:
     kind: str
     text: str
     position: int
 
 
-def _tokenize(source: str, label: str) -> list[_Token]:
-    tokens: list[_Token] = []
+def tokenize(source: str, label: str, keywords: frozenset[str] = CONDITION_KEYWORDS) -> list[Token]:
+    """Tokenize `source`, classifying bare identifiers in `keywords` as the
+    "keyword" kind. Shared by the condition/projection parser (AND/OR/NOT/
+    BETWEEN/IN) and `update_expression.py` (SET/REMOVE/ADD/DELETE), which
+    need different keyword sets over the same underlying token shapes.
+    """
+    tokens: list[Token] = []
     position = 0
     while position < len(source):
         if source[position:].strip() == "":
@@ -277,9 +282,9 @@ def _tokenize(source: str, label: str) -> list[_Token]:
         kind = match.lastgroup or ""
         text = match.group(kind)
         start = match.start(kind)
-        if kind == "ident" and text.upper() in _KEYWORDS:
+        if kind == "ident" and text.upper() in keywords:
             kind, text = "keyword", text.upper()
-        tokens.append(_Token(kind, text, start))
+        tokens.append(Token(kind, text, start))
         position = match.end()
     return tokens
 
@@ -292,29 +297,29 @@ class _Parser:
         self._source = source
         self._label = label
         self._context = context
-        self._tokens = _tokenize(source, label)
+        self._tokens = tokenize(source, label)
         self._index = 0
 
     # token helpers
-    def _peek(self, offset: int = 0) -> _Token | None:
+    def _peek(self, offset: int = 0) -> Token | None:
         index = self._index + offset
         return self._tokens[index] if index < len(self._tokens) else None
 
-    def _next(self) -> _Token:
+    def _next(self) -> Token:
         token = self._peek()
         if token is None:
             raise self._end_error()
         self._index += 1
         return token
 
-    def _accept(self, kind: str, text: str | None = None) -> _Token | None:
+    def _accept(self, kind: str, text: str | None = None) -> Token | None:
         token = self._peek()
         if token is not None and token.kind == kind and (text is None or token.text == text):
             self._index += 1
             return token
         return None
 
-    def _expect(self, kind: str, text: str | None = None) -> _Token:
+    def _expect(self, kind: str, text: str | None = None) -> Token:
         token = self._accept(kind, text)
         if token is None:
             raise self._syntax_error(self._peek())
@@ -325,7 +330,7 @@ class _Parser:
             f"Invalid {self._label}: Syntax error; unexpected end of expression"
         )
 
-    def _syntax_error(self, token: _Token | None) -> DynamoValidationError:
+    def _syntax_error(self, token: Token | None) -> DynamoValidationError:
         if token is None:
             return self._end_error()
         start = max(0, token.position - 10)
@@ -506,14 +511,13 @@ def parse_condition(expression: Any, label: str, context: ExpressionContext) -> 
     return node
 
 
-def parse_projection(expression: Any, label: str, context: ExpressionContext) -> list[Path]:
-    """Parse a ProjectionExpression: comma-separated document paths."""
-    parser = _start(expression, label, context)
-    paths = [parser.parse_path()]
-    while parser._accept("punct", ","):
-        paths.append(parser.parse_path())
-    parser.finish()
-
+def check_no_overlapping_paths(paths: list[Path], label: str) -> None:
+    """Reject two paths where one is a prefix of the other (`a` and `a.b`,
+    or the same path twice). Real DynamoDB applies this to both
+    ProjectionExpression and UpdateExpression target paths - two clauses
+    touching overlapping parts of the same document would leave the
+    outcome ambiguous.
+    """
     for index, first in enumerate(paths):
         for second in paths[index + 1 :]:
             shorter = min(len(first.parts), len(second.parts))
@@ -522,6 +526,16 @@ def parse_projection(expression: Any, label: str, context: ExpressionContext) ->
                     f"Invalid {label}: Two document paths overlap with each other; must remove "
                     f"or rewrite one of these paths; path one: [{first}], path two: [{second}]"
                 )
+
+
+def parse_projection(expression: Any, label: str, context: ExpressionContext) -> list[Path]:
+    """Parse a ProjectionExpression: comma-separated document paths."""
+    parser = _start(expression, label, context)
+    paths = [parser.parse_path()]
+    while parser._accept("punct", ","):
+        paths.append(parser.parse_path())
+    parser.finish()
+    check_no_overlapping_paths(paths, label)
     return paths
 
 

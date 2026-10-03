@@ -637,3 +637,190 @@ def test_scan_rejects_parallel_segments(dynamodb_client, filled_events):
     with pytest.raises(ClientError) as exc_info:
         dynamodb_client.scan(TableName=filled_events, Segment=0, TotalSegments=2)
     assert _error_code(exc_info) == "ValidationException"
+
+
+# -- UpdateItem (Phase 3d) ---------------------------------------------------
+
+
+def test_update_item_creates_the_item_when_missing(dynamodb_client, orders_table):
+    response = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key={"order_id": {"S": "1"}},
+        UpdateExpression="SET #s = :v",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":v": {"S": "open"}},
+        ReturnValues="ALL_NEW",
+    )
+    assert response["Attributes"] == {"order_id": {"S": "1"}, "status": {"S": "open"}}
+
+
+def test_update_item_set_and_add_together(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "hits": {"N": "3"}})
+    response = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="SET #s = :v ADD hits :n",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":v": {"S": "shipped"}, ":n": {"N": "1"}},
+        ReturnValues="ALL_NEW",
+    )
+    assert response["Attributes"]["status"] == {"S": "shipped"}
+    assert response["Attributes"]["hits"] == {"N": "4"}
+
+
+def test_update_item_return_values_updated_old_and_new(dynamodb_client, orders_table):
+    dynamodb_client.put_item(TableName=orders_table, Item={"order_id": {"S": "1"}, "n": {"N": "1"}})
+    old = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key={"order_id": {"S": "1"}},
+        UpdateExpression="SET n = :v",
+        ExpressionAttributeValues={":v": {"N": "2"}},
+        ReturnValues="UPDATED_OLD",
+    )
+    assert old["Attributes"] == {"n": {"N": "1"}}
+
+    new = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key={"order_id": {"S": "1"}},
+        UpdateExpression="SET n = :v",
+        ExpressionAttributeValues={":v": {"N": "3"}},
+        ReturnValues="UPDATED_NEW",
+    )
+    assert new["Attributes"] == {"n": {"N": "3"}}
+
+
+def test_update_item_if_not_exists_counter_pattern(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    common = dict(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="SET hits = if_not_exists(hits, :zero) + :one",
+        ExpressionAttributeValues={":zero": {"N": "0"}, ":one": {"N": "1"}},
+        ReturnValues="ALL_NEW",
+    )
+    first = dynamodb_client.update_item(**common)
+    assert first["Attributes"]["hits"] == {"N": "1"}
+    second = dynamodb_client.update_item(**common)
+    assert second["Attributes"]["hits"] == {"N": "2"}
+
+
+def test_update_item_list_append(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "log": {"L": [{"S": "a"}]}})
+    response = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="SET #l = list_append(#l, :v)",
+        ExpressionAttributeNames={"#l": "log"},
+        ExpressionAttributeValues={":v": {"L": [{"S": "b"}]}},
+        ReturnValues="ALL_NEW",
+    )
+    assert response["Attributes"]["log"] == {"L": [{"S": "a"}, {"S": "b"}]}
+
+
+def test_update_item_remove(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "scratch": {"S": "x"}})
+    response = dynamodb_client.update_item(
+        TableName=orders_table, Key=key, UpdateExpression="REMOVE scratch", ReturnValues="ALL_NEW"
+    )
+    assert "scratch" not in response["Attributes"]
+
+
+def test_update_item_add_and_delete_on_a_set(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "tags": {"SS": ["a"]}})
+    added = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="ADD tags :s",
+        ExpressionAttributeValues={":s": {"SS": ["b"]}},
+        ReturnValues="ALL_NEW",
+    )
+    assert set(added["Attributes"]["tags"]["SS"]) == {"a", "b"}
+
+    deleted = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="DELETE tags :s",
+        ExpressionAttributeValues={":s": {"SS": ["a", "b"]}},
+        ReturnValues="ALL_NEW",
+    )
+    assert "tags" not in deleted["Attributes"]
+
+
+def test_update_item_with_legacy_attribute_updates(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "hits": {"N": "5"}})
+    response = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        AttributeUpdates={"hits": {"Value": {"N": "1"}, "Action": "ADD"}},
+        ReturnValues="ALL_NEW",
+    )
+    assert response["Attributes"]["hits"] == {"N": "6"}
+
+
+def test_update_item_cannot_target_the_key(dynamodb_client, orders_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key={"order_id": {"S": "1"}},
+            UpdateExpression="SET order_id = :v",
+            ExpressionAttributeValues={":v": {"S": "2"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+    assert "part of the key" in str(exc_info.value)
+
+
+def test_update_item_rejects_mixing_legacy_and_modern_params(dynamodb_client, orders_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key={"order_id": {"S": "1"}},
+            UpdateExpression="SET a = :v",
+            AttributeUpdates={"b": {"Value": {"S": "x"}}},
+            ExpressionAttributeValues={":v": {"S": "1"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+
+
+def test_update_item_condition_expression_is_rejected(dynamodb_client, orders_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key={"order_id": {"S": "1"}},
+            UpdateExpression="SET a = :v",
+            ConditionExpression="attribute_exists(order_id)",
+            ExpressionAttributeValues={":v": {"S": "1"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+
+
+def test_update_item_on_missing_table_raises_resource_not_found(dynamodb_client):
+    with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
+        dynamodb_client.update_item(
+            TableName="ghost",
+            Key={"id": {"S": "1"}},
+            UpdateExpression="SET a = :v",
+            ExpressionAttributeValues={":v": {"S": "1"}},
+        )
+
+
+def test_update_item_query_sees_the_updated_value(dynamodb_client, events_table):
+    key = {"user_id": {"S": "u1"}, "seq": {"N": "1"}}
+    dynamodb_client.put_item(TableName=events_table, Item={**key, "kind": {"S": "pending"}})
+    dynamodb_client.update_item(
+        TableName=events_table,
+        Key=key,
+        UpdateExpression="SET kind = :v",
+        ExpressionAttributeValues={":v": {"S": "done"}},
+    )
+    response = dynamodb_client.query(
+        TableName=events_table,
+        KeyConditionExpression="user_id = :u",
+        FilterExpression="kind = :k",
+        ExpressionAttributeValues={":u": {"S": "u1"}, ":k": {"S": "done"}},
+    )
+    assert response["Count"] == 1
