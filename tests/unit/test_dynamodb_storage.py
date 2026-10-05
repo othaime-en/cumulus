@@ -288,3 +288,86 @@ def test_bulk_reads_raise_for_unknown_table(storage: DynamoDbStorage) -> None:
         storage.list_partition("missing", "x")
     with pytest.raises(TableNotFound):
         storage.list_items("missing", after=None, limit=None)
+
+
+# -- transactional_write (Phase 3e) -----------------------------------------
+
+
+def test_transactional_write_creates_when_condition_decides_true(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    item = {"order_id": {"S": "1"}, "v": {"S": "a"}}
+    passed, old, new = storage.transactional_write(
+        "orders", "1", None, lambda current: (True, item)
+    )
+    assert passed is True and old is None and new == item
+    assert storage.get_item("orders", "1", None) == item
+
+
+def test_transactional_write_condition_false_changes_nothing(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    original = {"order_id": {"S": "1"}, "v": {"S": "a"}}
+    storage.put_item("orders", "1", None, original)
+
+    passed, old, new = storage.transactional_write(
+        "orders", "1", None, lambda current: (False, None)
+    )
+    assert passed is False and old == original and new is None
+    assert storage.get_item("orders", "1", None) == original
+
+
+def test_transactional_write_decide_sees_the_current_item(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    storage.put_item("orders", "1", None, {"order_id": {"S": "1"}, "n": {"N": "5"}})
+
+    seen = []
+
+    def decide(current):
+        seen.append(current)
+        return True, {"order_id": {"S": "1"}, "n": {"N": "6"}}
+
+    storage.transactional_write("orders", "1", None, decide)
+    assert seen == [{"order_id": {"S": "1"}, "n": {"N": "5"}}]
+
+
+def test_transactional_write_new_item_none_deletes(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    storage.put_item("orders", "1", None, {"order_id": {"S": "1"}})
+
+    passed, old, new = storage.transactional_write("orders", "1", None, lambda c: (True, None))
+    assert passed is True and old is not None and new is None
+    assert storage.get_item("orders", "1", None) is None
+
+
+def test_transactional_write_delete_of_missing_item_is_a_no_op(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    passed, old, new = storage.transactional_write("orders", "1", None, lambda c: (True, None))
+    assert passed is True and old is None and new is None
+
+
+def test_transactional_write_raises_for_unknown_table(storage: DynamoDbStorage) -> None:
+    with pytest.raises(TableNotFound):
+        storage.transactional_write("missing", "1", None, lambda c: (True, {}))
+
+
+def test_transactional_write_an_exception_in_decide_rolls_back(storage: DynamoDbStorage) -> None:
+    _create_simple_table(storage)
+    original = {"order_id": {"S": "1"}, "v": {"S": "a"}}
+    storage.put_item("orders", "1", None, original)
+
+    def decide(current):
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        storage.transactional_write("orders", "1", None, decide)
+    assert storage.get_item("orders", "1", None) == original
+
+
+def test_put_item_and_delete_item_still_work_as_unconditional_wrappers(
+    storage: DynamoDbStorage,
+) -> None:
+    _create_simple_table(storage)
+    item = {"order_id": {"S": "1"}, "v": {"S": "a"}}
+    assert storage.put_item("orders", "1", None, item) is None
+    assert storage.get_item("orders", "1", None) == item
+    assert storage.delete_item("orders", "1", None) == item
+    assert storage.get_item("orders", "1", None) is None
