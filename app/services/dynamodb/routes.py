@@ -1,10 +1,11 @@
 """DynamoDB action handlers for the AWS JSON protocol.
 
 Implemented so far: table lifecycle (CreateTable, DeleteTable,
-DescribeTable, ListTables - Phase 3a), single-item CRUD by primary key
-(PutItem, GetItem, DeleteItem - Phase 3b), Query/Scan with filters and
-projections (Phase 3c), and UpdateItem with all four UpdateExpression
-clauses (Phase 3d). Conditional writes land in Phase 3e.
+DescribeTable, ListTables), single-item CRUD by primary key
+(PutItem, GetItem, DeleteItem), Query/Scan with filters and
+projections, UpdateItem with all four UpdateExpression clauses,
+and conditional writes - ConditionExpression and legacy
+Expected/ConditionalOperator - on PutItem, UpdateItem and DeleteItem.
 
 Dispatch itself (reading `X-Amz-Target`, routing to this module) lives in
 `app.gateway.router`, the same shape SQS already established: this module
@@ -18,15 +19,16 @@ from typing import Callable
 
 from app.gateway.errors import EmulatorError
 from app.services.dynamodb.attribute_values import DynamoValidationError, normalize_item
-from app.services.dynamodb.expression_parser import ExpressionContext
+from app.services.dynamodb.conditions import evaluate
+from app.services.dynamodb.expression_parser import ExpressionContext, Node, parse_condition
 from app.services.dynamodb.keys import extract_item_key, extract_request_key
+from app.services.dynamodb.legacy import legacy_expected_filter_node, legacy_update_actions
 from app.services.dynamodb.models import TableDefinition
 from app.services.dynamodb.projection import (
     project_item,
     reject_mixed_parameters,
     resolve_projection,
 )
-from app.services.dynamodb.legacy import legacy_update_actions
 from app.services.dynamodb.query import execute_query, execute_scan
 from app.services.dynamodb.update import (
     apply_update,
@@ -184,18 +186,9 @@ def _handle_list_tables(body: dict, storage: DynamoDbStorage) -> dict:
     return response
 
 
-_CONDITION_PARAMS = ("ConditionExpression", "Expected", "ConditionalOperator")
-
-
-def _reject_unsupported(body: dict, params: tuple[str, ...], planned_phase: str) -> None:
-    # Failing loudly beats ignoring: a silently dropped ConditionExpression
-    # would turn a "write only if absent" into an unconditional overwrite.
-    for param in params:
-        if param in body:
-            raise ValidationException(
-                f"{param} is not supported by this emulator yet "
-                f"(planned for Phase {planned_phase})."
-            )
+class ConditionalCheckFailedException(EmulatorError):
+    status_code = 400
+    aws_error_code = "ConditionalCheckFailedException"
 
 
 def _require_table(name: str, storage: DynamoDbStorage) -> TableDefinition:
@@ -212,14 +205,57 @@ def _wants_old_values(body: dict) -> bool:
     return bool(mode == "ALL_OLD")
 
 
+def _return_on_failure_mode(body: dict) -> str:
+    mode = body.get("ReturnValuesOnConditionCheckFailure", "NONE")
+    if mode not in ("ALL_OLD", "NONE"):
+        raise ValidationException(f"Return values set to invalid value: {mode}")
+    return mode
+
+
+def _resolve_condition(body: dict, context: ExpressionContext) -> Node | None:
+    """ConditionExpression, or the legacy Expected/ConditionalOperator pair,
+    shared by PutItem, DeleteItem and UpdateItem. The caller is responsible
+    for rejecting a mix of legacy and modern parameters first - PutItem and
+    DeleteItem only have this one legacy-vs-modern axis to check, but
+    UpdateItem has to lump its action-representation params in with these
+    too (see `_handle_update_item`), matching the single combined
+    "Non-expression parameters / Expression parameters" error real DynamoDB
+    raises for the whole request rather than one check per concern.
+    """
+    if "ConditionExpression" in body:
+        return parse_condition(body["ConditionExpression"], "ConditionExpression", context)
+    return legacy_expected_filter_node(body.get("Expected"), body.get("ConditionalOperator"))
+
+
+def _raise_condition_failed(body: dict, return_mode: str, old_item: dict | None) -> None:
+    extra = {"Item": old_item} if return_mode == "ALL_OLD" and old_item is not None else None
+    raise ConditionalCheckFailedException("The conditional request failed", extra=extra)
+
+
 def _handle_put_item(body: dict, storage: DynamoDbStorage) -> dict:
-    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
+    reject_mixed_parameters(body, ("Expected", "ConditionalOperator"), ("ConditionExpression",))
     table_def = _require_table(body["TableName"], storage)
     item = normalize_item(body["Item"])
     pk_value, sk_value = extract_item_key(table_def, item)
     return_old = _wants_old_values(body)
+    failure_mode = _return_on_failure_mode(body)
 
-    old_item = storage.put_item(table_def.name, pk_value, sk_value, item)
+    context = ExpressionContext(
+        body.get("ExpressionAttributeNames"), body.get("ExpressionAttributeValues")
+    )
+    condition = _resolve_condition(body, context)
+    context.check_all_used()
+
+    def decide(current: dict | None) -> tuple[bool, dict | None]:
+        if condition is not None and not evaluate(condition, current or {}):
+            return False, None
+        return True, item
+
+    condition_passed, old_item, _ = storage.transactional_write(
+        table_def.name, pk_value, sk_value, decide
+    )
+    if not condition_passed:
+        _raise_condition_failed(body, failure_mode, old_item)
     return {"Attributes": old_item} if return_old and old_item is not None else {}
 
 
@@ -239,13 +275,30 @@ def _handle_get_item(body: dict, storage: DynamoDbStorage) -> dict:
 
 
 def _handle_delete_item(body: dict, storage: DynamoDbStorage) -> dict:
-    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
+    reject_mixed_parameters(body, ("Expected", "ConditionalOperator"), ("ConditionExpression",))
     table_def = _require_table(body["TableName"], storage)
     pk_value, sk_value = extract_request_key(table_def, body["Key"])
     return_old = _wants_old_values(body)
+    failure_mode = _return_on_failure_mode(body)
 
-    # Deleting a missing key is not an error in real DynamoDB, same as S3.
-    old_item = storage.delete_item(table_def.name, pk_value, sk_value)
+    context = ExpressionContext(
+        body.get("ExpressionAttributeNames"), body.get("ExpressionAttributeValues")
+    )
+    condition = _resolve_condition(body, context)
+    context.check_all_used()
+
+    def decide(current: dict | None) -> tuple[bool, dict | None]:
+        if condition is not None and not evaluate(condition, current or {}):
+            return False, None
+        return True, None  # None => delete (a no-op if there was nothing there)
+
+    condition_passed, old_item, _ = storage.transactional_write(
+        table_def.name, pk_value, sk_value, decide
+    )
+    if not condition_passed:
+        _raise_condition_failed(body, failure_mode, old_item)
+    # Deleting a missing key is not an error when there's no condition to
+    # fail, matching real DynamoDB (and S3's idempotent object delete).
     return {"Attributes": old_item} if return_old and old_item is not None else {}
 
 
@@ -272,8 +325,16 @@ def _update_return_values(
 
 
 def _handle_update_item(body: dict, storage: DynamoDbStorage) -> dict:
-    _reject_unsupported(body, _CONDITION_PARAMS, "3e")
-    reject_mixed_parameters(body, ("AttributeUpdates",), ("UpdateExpression",))
+    # One combined check across BOTH axes (action representation and
+    # condition representation): real DynamoDB rejects any mix of legacy
+    # and expression-style parameters for the whole request, not per
+    # concern - UpdateExpression together with Expected is just as invalid
+    # as AttributeUpdates together with ConditionExpression.
+    reject_mixed_parameters(
+        body,
+        ("AttributeUpdates", "Expected", "ConditionalOperator"),
+        ("UpdateExpression", "ConditionExpression"),
+    )
     table_def = _require_table(body["TableName"], storage)
     pk_value, sk_value = extract_request_key(table_def, body["Key"])
     # extract_request_key already proved body["Key"] has exactly the
@@ -295,17 +356,28 @@ def _handle_update_item(body: dict, storage: DynamoDbStorage) -> dict:
             "Either the UpdateExpression or AttributeUpdates parameter must be specified "
             "in the request."
         )
-    context.check_all_used()
     validate_no_key_attribute_targets(actions, table_def)
+    # ConditionExpression shares the same ExpressionAttributeNames/Values
+    # pool as UpdateExpression - one context, so an unused placeholder is
+    # only flagged once both have had a chance to claim it.
+    condition = _resolve_condition(body, context)
+    context.check_all_used()
 
     return_mode = body.get("ReturnValues", "NONE")
     if return_mode not in _UPDATE_RETURN_MODES:
         raise ValidationException(f"Return values set to invalid value: {return_mode}")
+    failure_mode = _return_on_failure_mode(body)
 
-    old_item = storage.get_item(table_def.name, pk_value, sk_value)
-    new_item = apply_update(table_def, old_item, normalized_key, actions)
-    new_pk, new_sk = extract_item_key(table_def, new_item)
-    storage.put_item(table_def.name, new_pk, new_sk, new_item)
+    def decide(current: dict | None) -> tuple[bool, dict | None]:
+        if condition is not None and not evaluate(condition, current or {}):
+            return False, None
+        return True, apply_update(table_def, current, normalized_key, actions)
+
+    condition_passed, old_item, new_item = storage.transactional_write(
+        table_def.name, pk_value, sk_value, decide
+    )
+    if not condition_passed:
+        _raise_condition_failed(body, failure_mode, old_item)
 
     touched = touched_top_level_names(actions)
     return _update_return_values(return_mode, old_item, new_item, touched)
