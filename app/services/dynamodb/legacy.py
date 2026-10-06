@@ -13,7 +13,7 @@ semantics.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from app.services.dynamodb.attribute_values import (
     INVALID_PREFIX,
@@ -111,8 +111,18 @@ def legacy_condition_node(attribute: str, spec: Any) -> Node:
     return Between(path, low, high)
 
 
-def legacy_filter_node(filter_map: Any, conditional_operator: Any, label: str) -> Node | None:
-    """Convert a QueryFilter/ScanFilter map into one AND- or OR-joined node."""
+def legacy_filter_node(
+    filter_map: Any,
+    conditional_operator: Any,
+    label: str,
+    node_builder: Callable[[str, Any], Node] = legacy_condition_node,
+) -> Node | None:
+    """Convert a QueryFilter/ScanFilter/Expected map into one AND- or
+    OR-joined node. `node_builder` converts a single attribute's spec into a
+    condition node; it differs for `Expected` (see
+    `legacy_expected_condition_node` below), but the AND/OR combining logic
+    and validation are identical, so they're not duplicated per caller.
+    """
     if filter_map is None:
         if conditional_operator is not None:
             raise DynamoValidationError(
@@ -128,11 +138,52 @@ def legacy_filter_node(filter_map: Any, conditional_operator: Any, label: str) -
             f"{INVALID_PREFIX}ConditionalOperator must be AND or OR, got: {joiner}"
         )
 
-    nodes = [legacy_condition_node(attribute, spec) for attribute, spec in filter_map.items()]
+    nodes = [node_builder(attribute, spec) for attribute, spec in filter_map.items()]
     combined = nodes[0]
     for node in nodes[1:]:
         combined = And(combined, node) if joiner == "AND" else Or(combined, node)
     return combined
+
+
+def legacy_expected_condition_node(attribute: str, spec: Any) -> Node:
+    """Convert one `Expected` entry. Two independent forms are allowed:
+
+    - the same `{ComparisonOperator, AttributeValueList}` shape QueryFilter/
+      ScanFilter use (delegated straight to `legacy_condition_node`)
+    - the older, simpler `{Exists, Value}` shape - `Exists` defaults to
+      True, meaning "the attribute must equal Value"; `Exists: False` means
+      "the attribute must not exist" (and takes no Value). This is the
+      classic optimistic-locking/create-if-absent idiom predating
+      ConditionExpression entirely.
+    """
+    if not isinstance(spec, dict):
+        raise DynamoValidationError(f"{INVALID_PREFIX}Invalid Expected condition")
+    if "ComparisonOperator" in spec:
+        return legacy_condition_node(attribute, spec)
+
+    exists = spec.get("Exists", True)
+    path = Path((attribute,))
+    if not exists:
+        if "Value" in spec:
+            raise DynamoValidationError(
+                f"{INVALID_PREFIX}Value cannot be specified when Exists is false for Expected"
+            )
+        return Function("attribute_not_exists", (path,))
+    if "Value" not in spec:
+        raise DynamoValidationError(
+            f"{INVALID_PREFIX}Value must be specified when Exists is true for Expected"
+        )
+    return Compare("=", path, Literal(normalize_attribute_value(spec["Value"])))
+
+
+def legacy_expected_filter_node(expected: Any, conditional_operator: Any) -> Node | None:
+    """Convert `Expected` (+ optional `ConditionalOperator`) into one node -
+    the legacy conditional-write condition for PutItem/UpdateItem/DeleteItem,
+    sharing `legacy_filter_node`'s AND/OR combining with QueryFilter/ScanFilter.
+    """
+    return legacy_filter_node(
+        expected, conditional_operator, "Expected", legacy_expected_condition_node
+    )
 
 
 # -- Legacy UpdateItem (AttributeUpdates) ------------------------------------

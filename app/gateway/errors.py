@@ -18,9 +18,15 @@ class EmulatorError(Exception):
     status_code: int = 500
     aws_error_code: str = "InternalFailure"
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, extra: dict | None = None) -> None:
         super().__init__(message)
         self.message = message
+        # Most AWS errors are just {__type, message}, but a few carry one
+        # more field - DynamoDB's ConditionalCheckFailedException optionally
+        # returns the item's current attributes alongside the error, for
+        # instance. `extra` is merged into the JSON body as-is; unused by
+        # every error that doesn't need it.
+        self.extra = extra or {}
 
 
 class S3Error(EmulatorError):
@@ -37,7 +43,7 @@ async def emulator_error_handler(_request: Request, exc: EmulatorError) -> JSONR
     """Fallback handler, used by JSON-protocol services (SQS, DynamoDB)."""
     return JSONResponse(
         status_code=exc.status_code,
-        content={"__type": exc.aws_error_code, "message": exc.message},
+        content={"__type": exc.aws_error_code, "message": exc.message, **exc.extra},
     )
 
 

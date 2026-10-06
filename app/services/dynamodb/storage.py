@@ -13,7 +13,11 @@ Two tiers of state:
 - one dynamically-created physical table per DynamoDB table, holding that
   table's items. Phase 3a creates/drops these; Phase 3b adds single-item
   reads and writes (put/get/delete by primary key); Phase 3c adds the bulk
-  reads behind Query (one partition) and Scan (whole table, resumable).
+  reads behind Query (one partition) and Scan (whole table, resumable);
+  Phase 3e adds `transactional_write`, which lets a caller read the current
+  item and decide whether/what to write inside one transaction - what
+  conditional Put/Update/Delete need to check-then-act atomically.
+  `put_item`/`delete_item` are unconditional convenience wrappers over it.
 
 Plain Python exceptions and dataclasses in, plain Python exceptions and
 dataclasses out - no FastAPI or wire-protocol types here, mirroring
@@ -28,6 +32,7 @@ import re
 import time
 import uuid
 from functools import lru_cache
+from typing import Callable
 
 from sqlalchemy import (
     Column,
@@ -270,14 +275,29 @@ class DynamoDbStorage:
             raise TableNotFound(table_name)
         return item_table
 
-    def put_item(
-        self, table_name: str, pk_value: str, sk_value: str | None, item: dict
-    ) -> dict | None:
-        """Store `item`, replacing any item with the same key.
+    def transactional_write(
+        self,
+        table_name: str,
+        pk_value: str,
+        sk_value: str | None,
+        decide: Callable[[dict | None], tuple[bool, dict | None]],
+    ) -> tuple[bool, dict | None, dict | None]:
+        """Read the current item and let `decide(current)` decide what
+        happens next - all inside one transaction, so a conditional write's
+        check-then-act is atomic with respect to any other writer touching
+        this same item. (SQLite serializes writers at the database level, so
+        holding one open transaction across the read and the write is
+        sufficient here; there's no separate row-lock step to take.)
 
-        Returns the item that was replaced, or None if the key was new.
-        Read and write share one transaction so the returned old item is the
-        one actually overwritten.
+        `decide` returns `(should_write, new_item)`: `should_write=False`
+        means a condition failed and nothing changes. `should_write=True`
+        with `new_item=None` deletes the item (DeleteItem); `should_write=True`
+        with a dict inserts or replaces it (PutItem, UpdateItem) - the two
+        look identical to this method, since "insert" and "replace" are
+        already the same branch below (same as `put_item`'s before it).
+
+        Returns `(condition_passed, item_before, item_after)`. `item_after`
+        is None when `should_write` was False or the write deleted the item.
         """
         item_table = self._require_item_table(table_name)
         composite_key = _composite_key(pk_value, sk_value)
@@ -285,22 +305,45 @@ class DynamoDbStorage:
             old_row = conn.execute(
                 select(item_table.c.item_json).where(item_table.c.composite_key == composite_key)
             ).fetchone()
-            if old_row is None:
+            old_item = json.loads(old_row.item_json) if old_row is not None else None
+
+            should_write, new_item = decide(old_item)
+            if not should_write:
+                return False, old_item, None
+
+            if new_item is None:
+                if old_row is not None:
+                    conn.execute(
+                        delete(item_table).where(item_table.c.composite_key == composite_key)
+                    )
+            elif old_row is None:
                 conn.execute(
                     insert(item_table).values(
                         composite_key=composite_key,
                         pk_value=pk_value,
                         sk_value=sk_value,
-                        item_json=json.dumps(item),
+                        item_json=json.dumps(new_item),
                     )
                 )
             else:
                 conn.execute(
                     update(item_table)
                     .where(item_table.c.composite_key == composite_key)
-                    .values(item_json=json.dumps(item))
+                    .values(item_json=json.dumps(new_item))
                 )
-        return json.loads(old_row.item_json) if old_row is not None else None
+        return True, old_item, new_item
+
+    def put_item(
+        self, table_name: str, pk_value: str, sk_value: str | None, item: dict
+    ) -> dict | None:
+        """Store `item` unconditionally, replacing any item with the same
+        key. Returns the item that was replaced, or None if the key was new.
+        A thin, condition-free wrapper over `transactional_write`.
+        """
+        _, old_item, _ = self.transactional_write(
+            table_name, pk_value, sk_value, lambda _old: (True, item)
+        )
+        return old_item
 
     def get_item(self, table_name: str, pk_value: str, sk_value: str | None) -> dict | None:
         item_table = self._require_item_table(table_name)
@@ -313,16 +356,13 @@ class DynamoDbStorage:
         return json.loads(row.item_json) if row is not None else None
 
     def delete_item(self, table_name: str, pk_value: str, sk_value: str | None) -> dict | None:
-        """Remove the item with this key; returns it, or None if there was none."""
-        item_table = self._require_item_table(table_name)
-        composite_key = _composite_key(pk_value, sk_value)
-        with self._engine.begin() as conn:
-            old_row = conn.execute(
-                select(item_table.c.item_json).where(item_table.c.composite_key == composite_key)
-            ).fetchone()
-            if old_row is not None:
-                conn.execute(delete(item_table).where(item_table.c.composite_key == composite_key))
-        return json.loads(old_row.item_json) if old_row is not None else None
+        """Remove the item with this key unconditionally; returns it, or
+        None if there was none. A thin wrapper over `transactional_write`.
+        """
+        _, old_item, _ = self.transactional_write(
+            table_name, pk_value, sk_value, lambda _old: (True, None)
+        )
+        return old_item
 
     def list_partition(self, table_name: str, pk_value: str) -> list[dict]:
         """Every item sharing this partition key, in no particular order.

@@ -123,3 +123,72 @@ def test_boolean_combinations() -> None:
     assert _eval("age = :a AND #n = :b OR active = :t", {**values, ":t": {"BOOL": True}}, names)
     assert _eval("age = :a AND NOT #n = :b", values, {"#n": "name"}) is True
     assert _eval("(age = :a OR #n = :b) AND attribute_exists(id)", values, {"#n": "name"}) is True
+
+
+# -- Legacy Expected (Phase 3e) -----------------------------------------------
+
+from app.services.dynamodb.attribute_values import DynamoValidationError  # noqa: E402
+from app.services.dynamodb.legacy import (  # noqa: E402
+    legacy_expected_condition_node,
+    legacy_expected_filter_node,
+)
+
+
+def test_legacy_expected_exists_true_is_an_equality_check() -> None:
+    node = legacy_expected_condition_node("age", {"Value": {"N": "36"}})
+    assert evaluate(node, ITEM) is True
+    node_false = legacy_expected_condition_node("age", {"Value": {"N": "99"}})
+    assert evaluate(node_false, ITEM) is False
+
+
+def test_legacy_expected_exists_true_is_the_default() -> None:
+    implicit = legacy_expected_condition_node("age", {"Value": {"N": "36"}})
+    explicit = legacy_expected_condition_node("age", {"Exists": True, "Value": {"N": "36"}})
+    assert implicit == explicit
+
+
+def test_legacy_expected_exists_false_means_attribute_not_exists() -> None:
+    node = legacy_expected_condition_node("absent", {"Exists": False})
+    assert evaluate(node, ITEM) is True
+    node_present = legacy_expected_condition_node("age", {"Exists": False})
+    assert evaluate(node_present, ITEM) is False
+
+
+def test_legacy_expected_exists_false_rejects_a_value() -> None:
+    with pytest.raises(DynamoValidationError, match="Value cannot be specified"):
+        legacy_expected_condition_node("age", {"Exists": False, "Value": {"N": "1"}})
+
+
+def test_legacy_expected_exists_true_requires_a_value() -> None:
+    with pytest.raises(DynamoValidationError, match="Value must be specified"):
+        legacy_expected_condition_node("age", {})
+
+
+def test_legacy_expected_falls_back_to_comparison_operator_form() -> None:
+    node = legacy_expected_condition_node(
+        "age", {"ComparisonOperator": "GE", "AttributeValueList": [{"N": "18"}]}
+    )
+    assert evaluate(node, ITEM) is True
+
+
+def test_legacy_expected_filter_combines_multiple_attributes_with_and() -> None:
+    node = legacy_expected_filter_node(
+        {"age": {"Value": {"N": "36"}}, "absent": {"Exists": False}}, None
+    )
+    assert evaluate(node, ITEM) is True
+
+
+def test_legacy_expected_filter_or() -> None:
+    node = legacy_expected_filter_node(
+        {"age": {"Value": {"N": "1"}}, "absent": {"Exists": False}}, "OR"
+    )
+    assert evaluate(node, ITEM) is True
+
+
+def test_legacy_expected_filter_returns_none_when_absent() -> None:
+    assert legacy_expected_filter_node(None, None) is None
+
+
+def test_legacy_expected_filter_rejects_conditional_operator_without_expected() -> None:
+    with pytest.raises(DynamoValidationError, match="only be used together with Expected"):
+        legacy_expected_filter_node(None, "AND")

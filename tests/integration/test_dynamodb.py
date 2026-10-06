@@ -329,17 +329,6 @@ def test_item_operations_on_a_missing_table_raise_resource_not_found(dynamodb_cl
         dynamodb_client.delete_item(TableName="ghost", Key={"id": {"S": "1"}})
 
 
-def test_condition_expressions_are_rejected_rather_than_ignored(dynamodb_client, orders_table):
-    with pytest.raises(ClientError) as exc_info:
-        dynamodb_client.put_item(
-            TableName=orders_table,
-            Item={"order_id": {"S": "1"}},
-            ConditionExpression="attribute_not_exists(order_id)",
-        )
-    assert _error_code(exc_info) == "ValidationException"
-    assert dynamodb_client.describe_table(TableName=orders_table)["Table"]["ItemCount"] == 0
-
-
 def test_describe_table_item_count_tracks_writes(dynamodb_client, orders_table):
     for order_id in ("1", "2", "3"):
         dynamodb_client.put_item(TableName=orders_table, Item={"order_id": {"S": order_id}})
@@ -786,18 +775,6 @@ def test_update_item_rejects_mixing_legacy_and_modern_params(dynamodb_client, or
     assert _error_code(exc_info) == "ValidationException"
 
 
-def test_update_item_condition_expression_is_rejected(dynamodb_client, orders_table):
-    with pytest.raises(ClientError) as exc_info:
-        dynamodb_client.update_item(
-            TableName=orders_table,
-            Key={"order_id": {"S": "1"}},
-            UpdateExpression="SET a = :v",
-            ConditionExpression="attribute_exists(order_id)",
-            ExpressionAttributeValues={":v": {"S": "1"}},
-        )
-    assert _error_code(exc_info) == "ValidationException"
-
-
 def test_update_item_on_missing_table_raises_resource_not_found(dynamodb_client):
     with pytest.raises(dynamodb_client.exceptions.ResourceNotFoundException):
         dynamodb_client.update_item(
@@ -824,3 +801,192 @@ def test_update_item_query_sees_the_updated_value(dynamodb_client, events_table)
         ExpressionAttributeValues={":u": {"S": "u1"}, ":k": {"S": "done"}},
     )
     assert response["Count"] == 1
+
+
+# -- Conditional writes (Phase 3e) -------------------------------------------
+
+
+def test_put_item_create_if_not_exists(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(
+        TableName=orders_table,
+        Item={**key, "v": {"N": "1"}},
+        ConditionExpression="attribute_not_exists(order_id)",
+    )
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.put_item(
+            TableName=orders_table,
+            Item={**key, "v": {"N": "99"}},
+            ConditionExpression="attribute_not_exists(order_id)",
+        )
+    # The failed PutItem must not have overwritten the original.
+    stored = dynamodb_client.get_item(TableName=orders_table, Key=key)["Item"]
+    assert stored["v"] == {"N": "1"}
+
+
+def test_put_item_condition_check_failure_returns_the_current_item(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "v": {"N": "1"}})
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException) as exc_info:
+        dynamodb_client.put_item(
+            TableName=orders_table,
+            Item={**key, "v": {"N": "2"}},
+            ConditionExpression="attribute_not_exists(order_id)",
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+    assert exc_info.value.response["Item"]["v"] == {"N": "1"}
+
+
+def test_put_item_condition_check_failure_without_return_values_has_no_item(
+    dynamodb_client, orders_table
+):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "v": {"N": "1"}})
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException) as exc_info:
+        dynamodb_client.put_item(
+            TableName=orders_table,
+            Item={**key, "v": {"N": "2"}},
+            ConditionExpression="attribute_not_exists(order_id)",
+        )
+    assert "Item" not in exc_info.value.response
+
+
+def test_put_item_with_legacy_expected_exists_false(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    not_exists = {"order_id": {"Exists": False}}
+    dynamodb_client.put_item(
+        TableName=orders_table, Item={**key, "v": {"N": "1"}}, Expected=not_exists
+    )
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.put_item(TableName=orders_table, Item={**key}, Expected=not_exists)
+
+
+def test_put_item_with_legacy_expected_value_form(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "status": {"S": "draft"}})
+    dynamodb_client.put_item(
+        TableName=orders_table,
+        Item={**key, "status": {"S": "final"}},
+        Expected={"status": {"Value": {"S": "draft"}}},
+    )
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.put_item(
+            TableName=orders_table,
+            Item={**key, "status": {"S": "final2"}},
+            Expected={"status": {"Value": {"S": "draft"}}},
+        )
+
+
+def test_delete_item_with_condition(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "status": {"S": "open"}})
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.delete_item(
+            TableName=orders_table,
+            Key=key,
+            ConditionExpression="#s = :v",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":v": {"S": "closed"}},
+        )
+    response = dynamodb_client.delete_item(
+        TableName=orders_table,
+        Key=key,
+        ConditionExpression="#s = :v",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":v": {"S": "open"}},
+        ReturnValues="ALL_OLD",
+    )
+    assert response["Attributes"]["status"] == {"S": "open"}
+
+
+def test_delete_item_condition_on_a_missing_item_fails(dynamodb_client, orders_table):
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.delete_item(
+            TableName=orders_table,
+            Key={"order_id": {"S": "nope"}},
+            ConditionExpression="attribute_exists(order_id)",
+        )
+
+
+def test_update_item_optimistic_locking_pattern(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "version": {"N": "1"}})
+
+    response = dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        UpdateExpression="SET payload = :p, version = :newv",
+        ConditionExpression="version = :oldv",
+        ExpressionAttributeValues={":p": {"S": "a"}, ":newv": {"N": "2"}, ":oldv": {"N": "1"}},
+        ReturnValues="ALL_NEW",
+    )
+    assert response["Attributes"]["version"] == {"N": "2"}
+
+    # Same (now stale) version again must fail and leave the item untouched.
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key=key,
+            UpdateExpression="SET payload = :p2",
+            ConditionExpression="version = :oldv",
+            ExpressionAttributeValues={":p2": {"S": "b"}, ":oldv": {"N": "1"}},
+        )
+    unchanged = dynamodb_client.get_item(TableName=orders_table, Key=key)["Item"]
+    assert unchanged["payload"] == {"S": "a"}
+    assert unchanged["version"] == {"N": "2"}
+
+
+def test_update_item_condition_can_reference_an_attribute_the_update_does_not_touch(
+    dynamodb_client, orders_table
+):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "locked": {"BOOL": True}})
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key=key,
+            UpdateExpression="SET note = :n",
+            ConditionExpression="locked = :f",
+            ExpressionAttributeValues={":n": {"S": "x"}, ":f": {"BOOL": False}},
+        )
+
+
+def test_update_item_with_legacy_expected(dynamodb_client, orders_table):
+    key = {"order_id": {"S": "1"}}
+    dynamodb_client.put_item(TableName=orders_table, Item={**key, "n": {"N": "5"}})
+    dynamodb_client.update_item(
+        TableName=orders_table,
+        Key=key,
+        AttributeUpdates={"n": {"Value": {"N": "6"}, "Action": "PUT"}},
+        Expected={"n": {"Value": {"N": "5"}}},
+    )
+    with pytest.raises(dynamodb_client.exceptions.ConditionalCheckFailedException):
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key=key,
+            AttributeUpdates={"n": {"Value": {"N": "7"}, "Action": "PUT"}},
+            Expected={"n": {"Value": {"N": "5"}}},
+        )
+
+
+def test_update_item_rejects_mixing_update_expression_with_expected(dynamodb_client, orders_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.update_item(
+            TableName=orders_table,
+            Key={"order_id": {"S": "1"}},
+            UpdateExpression="SET n = :v",
+            Expected={"n": {"Value": {"N": "1"}}},
+            ExpressionAttributeValues={":v": {"N": "2"}},
+        )
+    assert _error_code(exc_info) == "ValidationException"
+    assert "Non-expression parameters" in str(exc_info.value)
+
+
+def test_condition_check_failure_invalid_return_mode_is_rejected(dynamodb_client, orders_table):
+    with pytest.raises(ClientError) as exc_info:
+        dynamodb_client.put_item(
+            TableName=orders_table,
+            Item={"order_id": {"S": "1"}},
+            ReturnValuesOnConditionCheckFailure="BOGUS",
+        )
+    assert _error_code(exc_info) == "ValidationException"
