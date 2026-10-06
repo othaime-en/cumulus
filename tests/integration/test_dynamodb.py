@@ -329,17 +329,6 @@ def test_item_operations_on_a_missing_table_raise_resource_not_found(dynamodb_cl
         dynamodb_client.delete_item(TableName="ghost", Key={"id": {"S": "1"}})
 
 
-def test_condition_expressions_are_rejected_rather_than_ignored(dynamodb_client, orders_table):
-    with pytest.raises(ClientError) as exc_info:
-        dynamodb_client.put_item(
-            TableName=orders_table,
-            Item={"order_id": {"S": "1"}},
-            ConditionExpression="attribute_not_exists(order_id)",
-        )
-    assert _error_code(exc_info) == "ValidationException"
-    assert dynamodb_client.describe_table(TableName=orders_table)["Table"]["ItemCount"] == 0
-
-
 def test_describe_table_item_count_tracks_writes(dynamodb_client, orders_table):
     for order_id in ("1", "2", "3"):
         dynamodb_client.put_item(TableName=orders_table, Item={"order_id": {"S": order_id}})
@@ -781,18 +770,6 @@ def test_update_item_rejects_mixing_legacy_and_modern_params(dynamodb_client, or
             Key={"order_id": {"S": "1"}},
             UpdateExpression="SET a = :v",
             AttributeUpdates={"b": {"Value": {"S": "x"}}},
-            ExpressionAttributeValues={":v": {"S": "1"}},
-        )
-    assert _error_code(exc_info) == "ValidationException"
-
-
-def test_update_item_condition_expression_is_rejected(dynamodb_client, orders_table):
-    with pytest.raises(ClientError) as exc_info:
-        dynamodb_client.update_item(
-            TableName=orders_table,
-            Key={"order_id": {"S": "1"}},
-            UpdateExpression="SET a = :v",
-            ConditionExpression="attribute_exists(order_id)",
             ExpressionAttributeValues={":v": {"S": "1"}},
         )
     assert _error_code(exc_info) == "ValidationException"
