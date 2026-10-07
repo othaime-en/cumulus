@@ -283,3 +283,10 @@ def test_publish_swallows_delivery_failures() -> None:
         event_name=OBJECT_CREATED_PUT,
         source_ip="127.0.0.1",
     )  # must not raise
+
+def test_sequencers_are_fixed_width_and_strictly_increasing() -> None:
+    sequencers = [_record()["s3"]["object"]["sequencer"] for _ in range(200)]
+
+    assert all(len(s) == 16 for s in sequencers)
+    assert sequencers == sorted(sequencers)
+    assert len(set(sequencers)) == len(sequencers)

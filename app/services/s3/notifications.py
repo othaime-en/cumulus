@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -205,6 +207,29 @@ def _parse_filter(raw_filter: Any) -> tuple[str, str]:
 # --- Event construction --------------------------------------------------------
 
 
+class _SequencerClock:
+    """Hands out strictly increasing, fixed-width hex sequencers.
+
+    Real S3 guarantees that, for one object key, a later event carries a
+    greater sequencer; consumers rely on that to discard duplicate or
+    out-of-order deliveries. Wall-clock nanoseconds alone aren't enough:
+    some platforms' clocks tick coarsely enough for two back-to-back
+    writes to share a value, so the last value handed out is tracked too.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last = 0
+
+    def next(self) -> str:
+        with self._lock:
+            self._last = max(time.time_ns(), self._last + 1)
+            return f"{self._last:016X}"
+
+
+_sequencer_clock = _SequencerClock()
+
+
 def _now_iso() -> str:
     dt = datetime.now(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
@@ -228,7 +253,7 @@ def build_event_record(
         s3_object["size"] = size
     if etag is not None:
         s3_object["eTag"] = etag
-    s3_object["sequencer"] = f"{uuid.uuid4().int >> 64:016X}"
+    s3_object["sequencer"] = _sequencer_clock.next()
 
     return {
         "eventVersion": "2.1",
