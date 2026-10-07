@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from xml.sax.saxutils import escape
 
+from app.services.s3.notifications import NotificationConfiguration
 from app.services.s3.storage import BucketMetadata, ObjectMetadata
 
 _XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -66,6 +67,32 @@ def list_objects_v2(
         f"{contents}"
         f"{prefix_entries}"
         "</ListBucketResult>"
+    )
+
+
+def notification_configuration(config: NotificationConfiguration) -> str:
+    entries = []
+    for rule in config.queue_rules:
+        events = "".join(f"<Event>{escape(event)}</Event>" for event in rule.events)
+        filter_rules = ""
+        if rule.prefix:
+            filter_rules += (
+                f"<FilterRule><Name>prefix</Name><Value>{escape(rule.prefix)}</Value></FilterRule>"
+            )
+        if rule.suffix:
+            filter_rules += (
+                f"<FilterRule><Name>suffix</Name><Value>{escape(rule.suffix)}</Value></FilterRule>"
+            )
+        filter_xml = f"<Filter><S3Key>{filter_rules}</S3Key></Filter>" if filter_rules else ""
+        entries.append(
+            f"<QueueConfiguration><Id>{escape(rule.id)}</Id>"
+            f"<Queue>{escape(rule.queue_arn)}</Queue>{events}{filter_xml}</QueueConfiguration>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<NotificationConfiguration xmlns="{_XMLNS}">'
+        f"{''.join(entries)}"
+        "</NotificationConfiguration>"
     )
 
 

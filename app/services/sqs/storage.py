@@ -122,6 +122,13 @@ class SqsStorage:
             ).fetchone()
         return self._row_to_queue(row) if row else None
 
+    def get_queue_by_arn(self, arn: str) -> Queue | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                select(queues_table).where(queues_table.c.arn == arn)
+            ).fetchone()
+        return self._row_to_queue(row) if row else None
+
     def get_queue_by_url(self, url: str) -> Queue | None:
         with self._engine.connect() as conn:
             row = conn.execute(
