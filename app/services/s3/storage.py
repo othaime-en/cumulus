@@ -25,8 +25,10 @@ from hashlib import md5
 from pathlib import Path
 
 from app.config import get_settings
+from app.services.s3.notifications import NotificationConfiguration
 
 BUCKET_META_FILENAME = ".bucket-meta.json"
+NOTIFICATION_CONFIG_FILENAME = ".notification-config.json"
 OBJECT_META_SUFFIX = ".objmeta.json"
 
 
@@ -150,6 +152,30 @@ class S3Storage:
             raise BucketNotEmptyError(bucket)
         shutil.rmtree(self._bucket_dir(bucket))
 
+    # --- Notification configuration ----------------------------------------
+
+    def get_notification_configuration(self, bucket: str) -> NotificationConfiguration:
+        if not self.bucket_exists(bucket):
+            raise BucketNotFoundError(bucket)
+        path = self._bucket_dir(bucket) / NOTIFICATION_CONFIG_FILENAME
+        if not path.is_file():
+            return NotificationConfiguration()
+        return NotificationConfiguration.from_dict(json.loads(path.read_text()))
+
+    def put_notification_configuration(
+        self, bucket: str, config: NotificationConfiguration
+    ) -> None:
+        """Replaces the whole configuration, as real S3 does; an empty
+        configuration clears it.
+        """
+        if not self.bucket_exists(bucket):
+            raise BucketNotFoundError(bucket)
+        path = self._bucket_dir(bucket) / NOTIFICATION_CONFIG_FILENAME
+        if config.is_empty():
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(json.dumps(config.to_dict()))
+
     # --- Objects ---------------------------------------------------------
 
     def put_object(self, bucket: str, key: str, body: bytes, content_type: str) -> ObjectMetadata:
@@ -184,14 +210,17 @@ class S3Storage:
             raise ObjectNotFoundError(key)
         return meta
 
-    def delete_object(self, bucket: str, key: str) -> None:
+    def delete_object(self, bucket: str, key: str) -> bool:
         """Idempotent, matching real S3: deleting a nonexistent key is not
-        an error.
+        an error. Returns whether the object existed, so callers can decide
+        whether a removal event is warranted.
         """
         if not self.bucket_exists(bucket):
             raise BucketNotFoundError(bucket)
+        existed = self._object_meta_path(bucket, key).is_file()
         self._object_path(bucket, key).unlink(missing_ok=True)
         self._object_meta_path(bucket, key).unlink(missing_ok=True)
+        return existed
 
     def list_objects(
         self,
