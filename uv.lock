@@ -170,6 +170,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+demo = [
+    { name = "boto3" },
+]
 dev = [
     { name = "boto3" },
     { name = "httpx" },
@@ -190,6 +193,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+demo = [{ name = "boto3", specifier = ">=1.36" }]
 dev = [
     { name = "boto3", specifier = ">=1.36" },
     { name = "httpx", specifier = ">=0.27" },
