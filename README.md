@@ -41,6 +41,12 @@ cp .env.example .env
 docker compose up --build
 ```
 
+This starts the emulator and an always-on consumer that indexes S3 object
+events into DynamoDB (see [the end-to-end demo](#running-the-end-to-end-demo)).
+If host port 4566 is unavailable, set `CUMULUS_HOST_PORT` (for example
+`CUMULUS_HOST_PORT=5566 docker compose up --build`) and point clients at
+that port; containers talk to each other on the internal port regardless.
+
 ## Using the S3 API
 
 Cumulus uses **path-style** bucket addressing (`http://host:port/bucket/key`)
@@ -77,7 +83,48 @@ s3.put_object(Bucket="my-bucket", Key="hello.txt", Body=b"hello world")
 
 Supported operations: `CreateBucket`, `DeleteBucket`, `HeadBucket`,
 `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `ListObjectsV2`
-(with `Prefix`/`Delimiter`).
+(with `Prefix`/`Delimiter`), and
+`PutBucketNotificationConfiguration` / `GetBucketNotificationConfiguration`
+(see below).
+
+### S3 event notifications
+
+A bucket publishes events to an SQS queue once a notification configuration
+is attached to it, exactly as in real S3:
+
+```python
+queue_url = sqs.create_queue(QueueName="uploads-events")["QueueUrl"]
+queue_arn = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])[
+    "Attributes"
+]["QueueArn"]
+
+s3.put_bucket_notification_configuration(
+    Bucket="my-bucket",
+    NotificationConfiguration={
+        "QueueConfigurations": [
+            {
+                "QueueArn": queue_arn,
+                "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "uploads/"}]}},
+            }
+        ]
+    },
+)
+```
+
+`PutObject` then emits an `ObjectCreated:Put` event and `DeleteObject` (of an
+existing key) an `ObjectRemoved:Delete` event, as the standard S3 event JSON
+(`Records[].s3.bucket.name`, `.object.key`, `.object.sequencer`, ...). Saving
+a configuration also sends an `s3:TestEvent` message, as real S3 does, so
+consumers must tolerate messages without `Records`. Object keys in events are
+form-URL-encoded; decode them with `urllib.parse.unquote_plus`.
+
+**Known gaps:** SQS is the only destination (SNS, Lambda and EventBridge
+configurations are rejected with `NotImplemented`); only the `Put` and
+`Delete` event types exist; configurations are validated for destination
+existence but not for overlapping rules or queue policies; and delivery is
+synchronous, exactly-once and in order, where real S3 is at-least-once and can
+reorder (which is what the `sequencer` is for).
 
 ## Using the SQS API
 
@@ -109,8 +156,10 @@ print(received["Messages"][0]["Body"])
 ```
 
 Supported operations: `CreateQueue` (idempotent), `DeleteQueue`,
-`GetQueueUrl`, `ListQueues` (with `QueueNamePrefix`), `GetQueueAttributes`,
-`SetQueueAttributes`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`
+`GetQueueUrl`, `ListQueues` (with `QueueNamePrefix`), `GetQueueAttributes`
+(stored attributes plus `QueueArn`, `CreatedTimestamp` and
+`ApproximateNumberOfMessages` / `...NotVisible` / `...Delayed`; no
+`LastModifiedTimestamp`), `SetQueueAttributes`, `SendMessage`, `SendMessageBatch`, `ReceiveMessage`
 (with visibility-timeout emulation), `DeleteMessage`, `DeleteMessageBatch`,
 and `MessageAttributes` (String/Binary) on send and receive.
 
@@ -119,6 +168,35 @@ and `MessageAttributes` (String/Binary) on send and receive.
 currently visible rather than actually waiting. `MD5OfMessageAttributes`
 is a stable-but-non-AWS-matching hash — informational only, since no
 `boto3` code path validates it client-side; `MD5OfMessageBody` is exact.
+
+## Running the end-to-end demo
+
+The demo ties the three services together: uploading to S3 puts an event on
+an SQS queue, a consumer reads it, and a record lands in DynamoDB. The demo
+script uploads, overwrites and deletes objects, then reads the DynamoDB
+catalog back and checks it matches (exiting non-zero if it doesn't, so it
+doubles as an end-to-end smoke test).
+
+Without Docker, in two terminals:
+
+```bash
+uv run uvicorn app.main:app --port 5566
+
+CUMULUS_ENDPOINT_URL=http://localhost:5566 \
+    uv run python -m demo.s3_to_sqs_to_dynamo
+```
+
+With Docker Compose, using the always-on consumer service:
+
+```bash
+docker compose up -d --build
+docker compose --profile demo run --rm demo
+```
+
+The consumer can also be run on its own: `uv run python -m demo.consumer`
+runs until interrupted, and `--once` drains the queue and exits. It deletes
+a message only after the DynamoDB write succeeds, and guards every write with
+the event's sequencer, so redelivered or out-of-order events are harmless.
 
 ## Troubleshooting
 

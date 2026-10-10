@@ -25,6 +25,19 @@ class Queue:
     attributes: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class QueueDepth:
+    """Message counts as GetQueueAttributes reports them.
+
+    visible: receivable right now. in_flight: received and hidden by a
+    visibility timeout. delayed: not yet receivable because of DelaySeconds.
+    """
+
+    visible: int
+    in_flight: int
+    delayed: int
+
+
 @dataclass
 class MessageAttributeValue:
     data_type: str

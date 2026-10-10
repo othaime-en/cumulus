@@ -17,6 +17,7 @@ from typing import Iterable
 
 from sqlalchemy import (
     Column,
+    ColumnElement,
     Engine,
     Float,
     Integer,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     String,
     Table,
     delete,
+    func,
     insert,
     select,
     update,
@@ -35,6 +37,7 @@ from app.services.sqs.models import (
     Message,
     MessageAttributeValue,
     Queue,
+    QueueDepth,
 )
 
 metadata = MetaData()
@@ -121,6 +124,28 @@ class SqsStorage:
                 select(queues_table).where(queues_table.c.name == name)
             ).fetchone()
         return self._row_to_queue(row) if row else None
+
+    def get_queue_depth(self, queue_url: str) -> QueueDepth:
+        queue = self.get_queue_by_url(queue_url)
+        if queue is None:
+            raise QueueNotFound(queue_url)
+
+        now = time.time()
+        in_queue = messages_table.c.queue_name == queue.name
+        hidden = messages_table.c.visible_at > now
+
+        def count(*conditions: ColumnElement[bool]) -> int:
+            statement = (
+                select(func.count()).select_from(messages_table).where(in_queue, *conditions)
+            )
+            with self._engine.connect() as conn:
+                return int(conn.execute(statement).scalar_one())
+
+        return QueueDepth(
+            visible=count(~hidden),
+            in_flight=count(hidden, messages_table.c.receive_count > 0),
+            delayed=count(hidden, messages_table.c.receive_count == 0),
+        )
 
     def get_queue_by_arn(self, arn: str) -> Queue | None:
         with self._engine.connect() as conn:

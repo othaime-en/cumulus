@@ -1,9 +1,54 @@
+# Shared by the two demo-side services: same image, same wiring to the emulator.
+x-demo-service: &demo-service
+  build:
+    context: .
+    target: demo
+  environment:
+    # The compose network address of the emulator (container port, not the host port).
+    CUMULUS_ENDPOINT_URL: http://cumulus:4566
+
 services:
   cumulus:
-    build: .
+    build:
+      context: .
+      target: emulator
     ports:
-      - "4566:4566"
+      # Override the host side with CUMULUS_HOST_PORT if 4566 is unavailable
+      # (e.g. inside a Windows excluded port range).
+      - "${CUMULUS_HOST_PORT:-4566}:4566"
     volumes:
       - ./data:/app/data
     env_file:
       - .env
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:4566/_health')"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # Always-on S3-event consumer: reads object events from SQS and keeps the
+  # DynamoDB object catalog current.
+  consumer:
+    <<: *demo-service
+    restart: unless-stopped
+    depends_on:
+      cumulus:
+        condition: service_healthy
+
+  # One-shot end-to-end demo, run on demand:
+  #   docker compose up -d
+  #   docker compose --profile demo run --rm demo
+  demo:
+    <<: *demo-service
+    profiles: ["demo"]
+    command: ["python", "-m", "demo.s3_to_sqs_to_dynamo", "--external-consumer"]
+    depends_on:
+      cumulus:
+        condition: service_healthy
+      consumer:
+        condition: service_started

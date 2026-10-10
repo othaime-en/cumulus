@@ -102,11 +102,20 @@ def _handle_get_queue_attributes(body: dict, base_url: str, storage: SqsStorage)
     queue = storage.get_queue_by_url(body["QueueUrl"])
     if queue is None:
         raise QueueDoesNotExist("The specified queue does not exist.")
+    depth = storage.get_queue_depth(body["QueueUrl"])
+    available = {
+        **queue.attributes,
+        "QueueArn": queue.arn,
+        "CreatedTimestamp": str(int(queue.created_at)),
+        "ApproximateNumberOfMessages": str(depth.visible),
+        "ApproximateNumberOfMessagesNotVisible": str(depth.in_flight),
+        "ApproximateNumberOfMessagesDelayed": str(depth.delayed),
+    }
     requested = body.get("AttributeNames", [])
     if not requested or "All" in requested:
-        attrs = queue.attributes
+        attrs = available
     else:
-        attrs = {k: v for k, v in queue.attributes.items() if k in requested}
+        attrs = {k: v for k, v in available.items() if k in requested}
     return {"Attributes": attrs}
 
 
