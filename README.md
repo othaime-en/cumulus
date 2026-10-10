@@ -169,6 +169,126 @@ currently visible rather than actually waiting. `MD5OfMessageAttributes`
 is a stable-but-non-AWS-matching hash — informational only, since no
 `boto3` code path validates it client-side; `MD5OfMessageBody` is exact.
 
+## Using the DynamoDB API
+
+Like SQS, DynamoDB needs no special `boto3` `Config`: it speaks the AWS JSON
+protocol (`X-Amz-Target: DynamoDB_20120810.<Action>`), which current botocore
+sends by default. These examples use the low-level client, where every value
+is typed (`{"S": "text"}`, `{"N": "42"}`):
+
+```python
+import boto3
+
+dynamodb = boto3.client(
+    "dynamodb",
+    endpoint_url="http://localhost:4566",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+
+dynamodb.create_table(
+    TableName="orders",
+    KeySchema=[
+        {"AttributeName": "customer_id", "KeyType": "HASH"},
+        {"AttributeName": "order_id", "KeyType": "RANGE"},
+    ],
+    AttributeDefinitions=[
+        {"AttributeName": "customer_id", "AttributeType": "S"},
+        {"AttributeName": "order_id", "AttributeType": "S"},
+    ],
+    BillingMode="PAY_PER_REQUEST",
+)
+
+dynamodb.put_item(
+    TableName="orders",
+    Item={
+        "customer_id": {"S": "c-1"},
+        "order_id": {"S": "o-1001"},
+        "status": {"S": "NEW"},
+        "total": {"N": "42.50"},
+    },
+)
+
+response = dynamodb.query(
+    TableName="orders",
+    KeyConditionExpression="customer_id = :c AND begins_with(order_id, :p)",
+    ExpressionAttributeValues={":c": {"S": "c-1"}, ":p": {"S": "o-"}},
+)
+print(response["Items"])
+```
+
+Updates and conditional writes use the same expression syntax as real
+DynamoDB. `status` is one of DynamoDB's reserved words, so it has to be
+referenced through an `ExpressionAttributeNames` placeholder:
+
+```python
+from botocore.exceptions import ClientError
+
+key = {"customer_id": {"S": "c-1"}, "order_id": {"S": "o-1001"}}
+
+dynamodb.update_item(
+    TableName="orders",
+    Key=key,
+    UpdateExpression="SET #s = :shipped ADD shipments :one",
+    ConditionExpression="#s = :new",
+    ExpressionAttributeNames={"#s": "status"},
+    ExpressionAttributeValues={
+        ":shipped": {"S": "SHIPPED"},
+        ":new": {"S": "NEW"},
+        ":one": {"N": "1"},
+    },
+)
+
+try:
+    # The order is no longer NEW, so the same update is now refused.
+    dynamodb.update_item(
+        TableName="orders",
+        Key=key,
+        UpdateExpression="SET #s = :shipped",
+        ConditionExpression="#s = :new",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":shipped": {"S": "SHIPPED"}, ":new": {"S": "NEW"}},
+    )
+except ClientError as error:
+    print(error.response["Error"]["Code"])  # ConditionalCheckFailedException
+```
+
+Supported operations: `CreateTable`, `DeleteTable`, `DescribeTable`,
+`ListTables` (with `ExclusiveStartTableName`/`Limit` pagination), `PutItem`,
+`GetItem`, `DeleteItem`, `UpdateItem`, `Query` and `Scan`.
+
+- **Both API generations work**, side by side: the modern expression API
+  (`KeyConditionExpression`, `FilterExpression`, `ProjectionExpression`,
+  `UpdateExpression`, `ConditionExpression`) and the legacy dict API
+  (`KeyConditions`, `QueryFilter`/`ScanFilter`, `AttributesToGet`,
+  `AttributeUpdates`, `Expected`, `ConditionalOperator`). As in real DynamoDB,
+  mixing the two in one request is rejected.
+- **All ten attribute types** (`S`, `N`, `B`, `BOOL`, `NULL`, `M`, `L`, `SS`,
+  `NS`, `BS`) round-trip, and `UpdateExpression` supports all four clauses
+  (`SET`, `REMOVE`, `ADD`, `DELETE`) including `list_append`,
+  `if_not_exists` and arithmetic.
+- **Conditional writes are atomic**: the condition check and the write happen
+  in one transaction. `ReturnValuesOnConditionCheckFailure=ALL_OLD` returns the
+  item that caused the failure.
+- **`CreateTable` is not idempotent**: a second call raises
+  `ResourceInUseException`, as in real DynamoDB (unlike `CreateBucket` and
+  `CreateQueue`). It also requires either `BillingMode="PAY_PER_REQUEST"` or a
+  `ProvisionedThroughput`, as real DynamoDB does.
+- **`Query` and `Scan` paginate** with `Limit`, `ExclusiveStartKey` and
+  `LastEvaluatedKey`. As in real DynamoDB, `Limit` counts items *evaluated*,
+  before any filter is applied.
+
+**Known gaps:** no Global or Local Secondary Indexes (`CreateTable` rejects
+them, and `Query`/`Scan` reject `IndexName`, rather than silently ignoring
+them); no transactions (`TransactWriteItems`/`TransactGetItems`) and no
+`BatchGetItem`/`BatchWriteItem`; no parallel scan (`Segment`/`TotalSegments`
+are rejected); no TTL, streams, PartiQL or `UpdateTable`. Unimplemented
+operations return `UnknownOperationException`. There is no 400 KB item-size
+limit, `ConsistentRead` is accepted and ignored (there is only one copy of the
+data), and `TableSizeBytes` is an approximation rather than AWS's internal
+storage accounting.
+
 ## Running the end-to-end demo
 
 The demo ties the three services together: uploading to S3 puts an event on
